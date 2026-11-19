@@ -117,6 +117,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
+                # With a pinned CPU source the copies below are async to the host. The current
+                # stream (the next forward, the param all-gather) waits for them through the event
+                # recorded at the end; the host writes a CPU master again only after
+                # _wait_h2d_copies() (step, state loads).
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
@@ -147,6 +151,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             elif self.param_update_in_fp32:
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
 
+    def _wait_h2d_copies(self):
+        """Block the host until the copy-back H2D copies issued so far are done.
+
+        The copies read the pinned CPU masters asynchronously; a host write to a master (the next
+        CPU optimizer step, a state load) must not overtake them."""
+        h2d_stream = getattr(self, "_h2d_stream", None)
+        if h2d_stream is not None:
+            h2d_stream.synchronize()
+
     def step(self, closure=None):
         """
         Override the step method to perform the following operations:
@@ -167,6 +180,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.gpu_optimizer:
             self.gpu_optimizer.step(closure)
 
+        # The previous step's copy-back reads the CPU masters that the CPU optimizers write next.
+        # (The D2H event below already orders after it through the current stream; this keeps the
+        # guarantee local. It returns at once in training: the copies ended before the backward.)
+        self._wait_h2d_copies()
         for cpu_optimizer in self.cpu_optimizers:
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
@@ -270,12 +287,28 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
+                to_fp32 = self.param_update_in_fp32 and param.dtype != torch.float32
                 if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    param = param.detach().clone().cpu()
+                    if not to_fp32:
+                        # This copy is the CPU param itself; with to_fp32 it is only the way to the
+                        # fp32 master below, which is the tensor the copy-back hook reads.
+                        param = param.pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                if to_fp32:
+                    if cpu_copy and self.pin_cpu_params:
+                        # The copy-back hook copies this master to the GPU with
+                        # non_blocking=True. From pageable memory that H2D blocks the host
+                        # for the whole transfer; from pinned memory it runs on the H2D
+                        # stream while the host steps the next CPU optimizer.
+                        fp32_param = torch.empty(
+                            param.shape, dtype=torch.float32, device="cpu", pin_memory=True
+                        )
+                        fp32_param.copy_(param)
+                        param = fp32_param
+                    else:
+                        param = param.detach().clone().float()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -369,6 +402,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
             return
+        self._wait_h2d_copies()
         for param, v in self.state.items():
             # Native FP32 params do not need a separate master parameter and are
             # intentionally absent from param_to_fp32_param.
@@ -380,6 +414,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         """
         Update the fp32 parameters by the new parameters.
         """
+        self._wait_h2d_copies()
         for param, fp32_param in self.param_to_fp32_param.items():
             fp32_param.data.copy_(param)
         # A param that is already fp32 gets no entry above, so its offloaded copy -- taken
@@ -408,6 +443,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             """
             if not self.param_update_in_fp32:
                 return state_dict
+            self._wait_h2d_copies()
 
             new_state = {}
             for param, v in self.state.items():
@@ -440,6 +476,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # 2. After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
             # cpu copy pairs.
+            # A state dict saved by another optimizer (TE FusedAdam of the plain
+            # DistributedOptimizer) carries only that optimizer's param-group keys, and
+            # Optimizer.load_state_dict replaces each group with the saved one. Fill the keys
+            # it lacks with this HDO's launch-time defaults, as add_param_group did at
+            # construction (e.g. fused=True for the CPU AdamW); saved values win. An HDO save
+            # carries every default key, so this changes nothing for it.
+            for group in self.param_groups:
+                for key, value in self.defaults.items():
+                    group.setdefault(key, value)
             self._init_sub_optimizers()
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
