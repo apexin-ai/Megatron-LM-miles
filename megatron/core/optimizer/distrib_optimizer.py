@@ -1399,6 +1399,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
+                # These are sized to the compact (bucket-end padding stripped) layout, which is
+                # exactly what the loop below fills and what the load paths read back.
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
@@ -1857,10 +1859,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Note: for NVFP4, param_index_map uses unpacked (full numel)
                 # offsets, which is correct here since optimizer states
                 # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
+
+                # Compute cumulative bucket-end padding stripped before each bucket.
+                # world_tensors has bucket-end padding stripped, but param_index_map
+                # indices include bucket-end padding. We need to adjust indices.
+                cumulative_padding_stripped = [0]  # For bucket 0, no prior padding stripped
+                for bucket in buffer.buckets[:-1]:  # All but last bucket
+                    bucket_padding = bucket.grad_data.numel() - bucket.numel_unpadded
+                    cumulative_padding_stripped.append(
+                        cumulative_padding_stripped[-1] + bucket_padding
+                    )
+
                 for model_param, (
                     param_world_start,
                     param_world_end,
-                    _,
+                    bucket_id,
                 ) in buffer.param_index_map.items():
                     try:
                         sharded_metadata = param_to_sharded_metadata[model_param]
@@ -1876,6 +1889,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
 
+                    # Adjust indices to account for stripped bucket-end padding.
+                    # param_world_start/end are indices in the buffer (with padding),
+                    # but world_tensors has the bucket-end padding stripped.
+                    padding_adjustment = cumulative_padding_stripped[bucket_id]
+                    adjusted_start = param_world_start - padding_adjustment
+                    adjusted_end = param_world_end - padding_adjustment
+
                     tensors = {}
                     for state_key in world_tensor_keys:
                         if state_key == 'step' or state_key == 'numel_unpadded':
@@ -1883,25 +1903,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # specifically and is read from param_groups.
                             # Numel unpadded is not needed.
                             continue
-                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
-                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
+                        assert adjusted_end <= world_tensors[state_key].numel(), (
+                            f"'{sharded_metadata.key}' range [{adjusted_start}, {adjusted_end})"
+                            f" runs past the coalesced buffer"
+                            f" ({world_tensors[state_key].numel()} elements);"
+                            f" bucket-padding adjustment is wrong."
+                        )
+                        state_ten = world_tensors[state_key][adjusted_start:adjusted_end]
 
-                        if missing_elems_num > 0:
-                            # `state_ten` is shorter than the slice which means the world_tensor
-                            # is shorter than `param_world_end` - this is a bug in the param ranges
-                            # logic. Here we can only pad this with zeros as a workaround.
-                            # TODO: this assert shouldn't hold and indicates a bug, see issue #504
-                            assert param_world_end > buffer.numel_unpadded
-
-                            logger.warning(
-                                f"'{sharded_metadata.key}' param range exceeds"
-                                f" unpadded buffer by {missing_elems_num} elements."
-                                f" It will be padded with zeros which can lead to"
-                                f" data corruption."
-                            )
-                            state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
-
-                        assert len(state_ten) == param_world_end - param_world_start, (
+                        assert len(state_ten) == (param_world_end - param_world_start), (
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
@@ -1992,7 +2002,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # The global ckpt tensors must be fully covered.
                     # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    if not bucket_state:
+                        # Trailing padding is excluded from the checkpoint. Interior padding
+                        # still needs a shard so that the checkpoint tensor is fully covered.
+                        if data_parallel_rank * gbuf_local_numel >= gbuf_world_numel_unpadded:
+                            continue
+                        template = self._get_main_param_and_optimizer_states(
+                            next(iter(self.model_param_group_index_map))
+                        )
+                        bucket_state.append(
+                            {
+                                **{
+                                    k: torch.empty(gbuf_local_numel, dtype=v.dtype, device=v.device)
+                                    for k, v in template.items()
+                                    if isinstance(v, torch.Tensor)
+                                },
+                                'gbuf_local_start': 0,
+                                'gbuf_local_end': gbuf_local_numel,
+                                'padding': True,
+                            }
+                        )
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
@@ -2171,6 +2200,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    if not gbuf_range_map["param_map"]:
+                        # Padding-only shards have no parameter state to restore.
+                        continue
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
                     bucket_state = [
                         bucket_state_elem
