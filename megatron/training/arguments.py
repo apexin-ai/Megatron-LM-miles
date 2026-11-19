@@ -4214,6 +4214,14 @@ def _add_distributed_args(parser):
         help='If set, overlap param all-gather of first bucket with optimizer step.',
     )
     group.add_argument(
+        '--dedupe-chained-param-sync',
+        action='store_true',
+        default=False,
+        help='If set, a chain of distributed optimizers (dense + expert) all-gathers each '
+        'param bucket group once per step after the last optimizer step, instead of once '
+        'per optimizer. Synchronous param gather only (no effect with --overlap-param-gather).',
+    )
+    group.add_argument(
         '--no-align-param-gather',
         action='store_false',
         help='If not set, all PP stages will launch param all-gathers simultaneously. '
