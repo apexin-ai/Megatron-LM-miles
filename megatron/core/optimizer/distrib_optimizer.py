@@ -63,6 +63,7 @@ from ..fp8_utils import (
 )
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -72,7 +73,6 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
-from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 
 logger = getLogger(__name__)
 
@@ -1049,8 +1049,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if low_mem_resume and USING_TE_OPTIMIZER and not is_patch_applied():
                                 apply_fused_adam_patch()
                             init_device = 'cpu' if low_mem_resume else torch.cuda.current_device()
-                            init_shard = lambda dtype=torch.float32, _device=init_device: torch.empty(
-                                (numel,), dtype=dtype, device=_device
+                            init_shard = (
+                                lambda dtype=torch.float32, _device=init_device: torch.empty(
+                                    (numel,), dtype=dtype, device=_device
+                                )
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
