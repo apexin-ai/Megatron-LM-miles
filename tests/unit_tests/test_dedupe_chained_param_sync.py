@@ -26,6 +26,7 @@ parameters must be **bitwise identical** — that, plus the gather count, is wha
 here.  None of the deferral machinery works with ``--overlap-param-gather`` or Megatron-FSDP,
 so the flag must be inert there (asserted too).
 """
+
 import gc
 import os
 import sys
@@ -69,7 +70,9 @@ def _restore(model, params0):
 def _assert_bitwise_equal(a, b, what):
     assert a.dtype == b.dtype, f"{what}: dtype {a.dtype} vs {b.dtype}"
     assert a.shape == b.shape, f"{what}: shape {a.shape} vs {b.shape}"
-    assert torch.equal(a, b), f"{what}: not bitwise equal (max |diff| {(a.float()-b.float()).abs().max()})"
+    assert torch.equal(
+        a, b
+    ), f"{what}: not bitwise equal (max |diff| {(a.float()-b.float()).abs().max()})"
 
 
 class _GatherCounter:
@@ -82,6 +85,7 @@ class _GatherCounter:
     def __enter__(self):
         self._orig = [chunk._start_bucket_group_param_sync for chunk in self.chunks]
         for chunk, orig in zip(self.chunks, self._orig):
+
             def hook(bucket_group, force_sync=False, _orig=orig):
                 self.calls.append(id(bucket_group))
                 return _orig(bucket_group, force_sync=force_sync)
@@ -185,9 +189,9 @@ class TestDedupeChainedParamSync:
             rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
             global_batch_size=args.global_batch_size,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_size=torch.distributed.get_world_size()
-            if torch.distributed.is_initialized()
-            else 1,
+            data_parallel_size=(
+                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            ),
         )
         return args
 
@@ -305,5 +309,6 @@ class TestDedupeChainedParamSync:
             _assert_bitwise_equal(on_outs[s], off_outs[s], f"output step {s}")
             assert on_params[s].keys() == off_params[s].keys(), f"param set mismatch step {s}"
             for name in on_params[s]:
-                _assert_bitwise_equal(on_params[s][name], off_params[s][name],
-                                      f"param step {s} {name}")
+                _assert_bitwise_equal(
+                    on_params[s][name], off_params[s][name], f"param step {s} {name}"
+                )
