@@ -1959,10 +1959,63 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return success
 
+    def _should_dedupe_param_sync(self) -> bool:
+        """Return whether each DistOpt-managed bucket group is all-gathered once per step.
+
+        Every DistributedOptimizer of the chain syncs all bucket groups of its model chunks
+        (``start_param_sync_for_bucket_group_subset``), and dense and expert DistOpts share the
+        same chunks: without this, each bucket group is all-gathered once per DistOpt, and the
+        earlier gathers carry the later DistOpts' not yet updated shards (overwritten by the
+        last gather). With ``dedupe_chained_param_sync`` the chain takes the deferred path of
+        the MXFP8 case: the children only stage their updated shards, then each bucket group
+        is all-gathered once after the last child step. An all-gather only copies, so the
+        final parameters are bitwise the same. Synchronous DDP param gather only.
+        """
+        if not getattr(self.config, 'dedupe_chained_param_sync', False):
+            return False
+
+        from .distrib_optimizer import DistributedOptimizer
+
+        dist_optimizers = [
+            optimizer
+            for optimizer in self.chained_optimizers
+            if isinstance(optimizer, DistributedOptimizer)
+        ]
+
+        def _why_not(reason: str) -> bool:
+            # The flag is a no-op when the chain does not have two or more synchronous
+            # DistributedOptimizers, which is easy to hit (any EP=1 run, async gather, FSDP).
+            # Say so once instead of silently doing nothing -- a silently ignored flag reads
+            # like a win that never happened.
+            if not getattr(self, '_dedupe_skip_logged', False):
+                self._dedupe_skip_logged = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f'--dedupe-chained-param-sync is set but has no effect: {reason}. '
+                    'Param sync stays as it is.',
+                )
+            return False
+
+        if self.config.overlap_param_gather_with_optimizer_step:
+            return _why_not('--overlap-param-gather-with-optimizer-step is set')
+        if len(dist_optimizers) < 2:
+            return _why_not(
+                f'the chain has {len(dist_optimizers)} DistributedOptimizer(s); a separate '
+                'expert optimizer needs --expert-model-parallel-size > 1 (or ETP != TP)'
+            )
+        if not all(
+            not optimizer.ddp_config.overlap_param_gather
+            and not optimizer.ddp_config.use_megatron_fsdp
+            for optimizer in dist_optimizers
+        ):
+            return _why_not('--overlap-param-gather or Megatron-FSDP is enabled')
+        return True
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
-        if self._should_defer_mxfp8_param_sync():
+        if self._should_defer_mxfp8_param_sync() or self._should_dedupe_param_sync():
             return self._step_with_deferred_mxfp8_param_sync()
         return self._step()
 

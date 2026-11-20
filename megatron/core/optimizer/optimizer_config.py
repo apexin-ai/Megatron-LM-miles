@@ -341,6 +341,13 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    dedupe_chained_param_sync: bool = False
+    """If true, a ChainedOptimizer of two or more DistributedOptimizers (e.g. dense + expert) with
+    the synchronous DDP param gather all-gathers each bucket group once per step, after the last
+    child step, instead of once per child (each child walks all bucket groups of the shared model
+    chunks; the earlier gathers carry other children's not yet updated shards and are overwritten).
+    Final parameters are the same. No effect with overlap_param_gather or Megatron-FSDP."""
+
     #######################
     # Optimizer Offload
     #######################
