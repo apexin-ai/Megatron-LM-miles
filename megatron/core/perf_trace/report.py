@@ -541,6 +541,141 @@ def draw_overlap(store: TraceStore, step: int, rank: int) -> bytes:
     return _png(fig)
 
 
+def trace_json(store: TraceStore, step: int) -> dict:
+    """Compact payload for the interactive viewer: per rank, per lane, absolute intervals.
+
+    Everything is in microseconds relative to the step anchor, which is the same origin the
+    records use, so the browser needs no clock conversion -- only pixel mapping.
+    """
+    ranks = []
+    for rank in store.ranks(step):
+        rec = store.get(step, rank) or {}
+        fwd, bwd = [], []
+        for layer in rec.get('layers', []):
+            if 'fs' in layer and layer.get('fwd'):
+                fwd.append({'n': layer['n'], 's': layer['fs'], 'd': layer['fwd']})
+            if 'bs' in layer and layer.get('bwd'):
+                bwd.append({'n': layer['n'], 's': layer['bs'], 'd': layer['bwd']})
+        comm = [
+            {'n': a['n'], 'layer': a.get('layer', ''), 's': a['s'], 'd': a['d']}
+            for a in rec.get('a2a', [])
+        ]
+        other = [{'n': sp['n'], 's': sp['s'], 'd': sp['d']} for sp in rec.get('spans', [])]
+        ranks.append(
+            {
+                'rank': rank,
+                'end': rec.get('phases', {}).get('__end__', 0),
+                'fwd': fwd,
+                'bwd': bwd,
+                'comm': comm,
+                'other': other,
+            }
+        )
+    duration = max((r['end'] for r in ranks), default=0) or 1
+    return {'step': step, 'duration_us': duration, 'ranks': ranks}
+
+
+# --------------------------------------------------------------------- perfetto export
+# Perfetto's UI (ui.perfetto.dev, Apache-2.0) reads Chrome Trace Event JSON. Emitting that
+# format gives the whole Perfetto experience -- zoom, pan, per-slice duration, search, SQL --
+# without writing a viewer. Tracks are (pid=rank, tid=lane), which is exactly our data model.
+_PERFETTO_TIDS = {'fwd': 1, 'bwd': 2, 'comm': 3, 'other': 4, 'step': 5}
+_PERFETTO_TID_NAMES = {1: 'forward', 2: 'backward', 3: 'comm', 4: 'optimizer/other', 5: 'step'}
+
+
+def to_perfetto(store: TraceStore, steps: Optional[List[int]] = None) -> dict:
+    """Convert records into a Chrome Trace Event document Perfetto can open.
+
+    With several steps the timelines are laid end to end and a ``step N`` slice marks each
+    boundary, so one file covers a whole training window instead of a single step.
+    """
+    steps = steps if steps is not None else store.steps()
+    events: List[dict] = []
+    offset = 0.0
+    for step in steps:
+        ranks = store.ranks(step)
+        if not ranks:
+            continue
+        step_len = 0.0
+        for rank in ranks:
+            rec = store.get(step, rank) or {}
+            end = rec.get('phases', {}).get('__end__', 0) or 0
+            step_len = max(step_len, end)
+        for rank in ranks:
+            rec = store.get(step, rank) or {}
+            for lane, key, name_key in (('fwd', 'fs', 'fwd'), ('bwd', 'bs', 'bwd')):
+                for layer in rec.get('layers', []):
+                    if key not in layer or not layer.get(name_key):
+                        continue
+                    events.append(
+                        {
+                            'ph': 'X',
+                            'name': layer['n'],
+                            'pid': rank,
+                            'tid': _PERFETTO_TIDS[lane],
+                            'ts': offset + layer[key],
+                            'dur': layer[name_key],
+                            'args': {'step': step, 'layer': layer['n'], 'lane': lane},
+                        }
+                    )
+            for a in rec.get('a2a', []):
+                events.append(
+                    {
+                        'ph': 'X',
+                        'name': f"{a['n']} {a.get('layer', '')}".strip(),
+                        'pid': rank,
+                        'tid': _PERFETTO_TIDS['comm'],
+                        'ts': offset + a['s'],
+                        'dur': a['d'],
+                        'args': {'step': step, 'layer': a.get('layer', ''), 'op': a['n']},
+                    }
+                )
+            for sp in rec.get('spans', []):
+                events.append(
+                    {
+                        'ph': 'X',
+                        'name': sp['n'],
+                        'pid': rank,
+                        'tid': _PERFETTO_TIDS['other'],
+                        'ts': offset + sp['s'],
+                        'dur': sp['d'],
+                        'args': {'step': step},
+                    }
+                )
+            # one step-boundary slice per rank keeps the tracks aligned
+            events.append(
+                {
+                    'ph': 'X',
+                    'name': f'step {step}',
+                    'pid': rank,
+                    'tid': _PERFETTO_TIDS['step'],
+                    'ts': offset,
+                    'dur': step_len or 1,
+                    'args': {'step': step},
+                }
+            )
+        offset += (step_len or 1) + 1000.0  # 1 ms visual gap between steps
+
+    for rank in sorted({e['pid'] for e in events}):
+        events.append(
+            {'ph': 'M', 'name': 'process_name', 'pid': rank, 'args': {'name': f'rank {rank}'}}
+        )
+    first_pid = min((e['pid'] for e in events if 'pid' in e), default=0)
+    for tid, name in _PERFETTO_TID_NAMES.items():
+        events.append(
+            {'ph': 'M', 'name': 'thread_name', 'pid': first_pid, 'tid': tid, 'args': {'name': name}}
+        )
+        for rank in sorted({e['pid'] for e in events}):
+            events.append(
+                {'ph': 'M', 'name': 'thread_name', 'pid': rank, 'tid': tid, 'args': {'name': name}}
+            )
+    return {
+        'traceEvents': events,
+        'displayTimeUnit': 'ms',
+        'metadata': {'source': 'megatron perf_trace', 'steps': list(steps)},
+    }
+
+
 def comm_overlap_stats(store: TraceStore, step: int) -> Dict[int, Dict[str, float]]:
     """Per rank: how much of the all-to-all time actually overlapped compute.
 

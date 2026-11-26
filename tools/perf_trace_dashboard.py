@@ -70,6 +70,8 @@ draw_step_trends = _report.draw_step_trends
 draw_layer_start_heatmap = _report.draw_layer_start_heatmap
 draw_overlap = _report.draw_overlap
 draw_pipeline_gantt = _report.draw_pipeline_gantt
+trace_json = _report.trace_json
+to_perfetto = _report.to_perfetto
 comm_overlap_stats = _report.comm_overlap_stats
 
 STORE: TraceStore = None  # set in main()
@@ -268,7 +270,11 @@ def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
  <div><h2>comm overlap</h2>{ov_table}</div>
  <div><h2>phase timers</h2>{cpu_table}</div>
 </div>
-<h2>per-rank pipeline &mdash; every layer at its real start/end (the main view)</h2>
+<h2>per-rank pipeline &mdash; every layer at its real start/end
+  <a href="/gantt?step={step}">interactive viewer (zoom / pan / hover)</a> &nbsp;|&nbsp;
+  <a href="/trace.json?step={step}" download>download this step</a> &nbsp;|&nbsp;
+  <a href="/trace.json?all=1" download>download all steps</a>
+  &nbsp;&mdash; drag the file into <b>ui.perfetto.dev</b> for full Perfetto zoom/pan/hover</h2>
 <img src="/png/gantt?step={step}&t={os.getpid()}" width="1300">
 <h2>when each rank started each layer &mdash; a bright row is a late rank, a bright cell is a late layer</h2>
 <img src="/png/starts?step={step}&t={os.getpid()}" width="1250">
@@ -301,6 +307,44 @@ if (REFRESH > 0) {{
 """
 
 
+INTERACTIVE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>pipeline trace viewer</title>
+<style>
+ body { margin: 0; font-family: system-ui, sans-serif; background: #fff; color: #222; }
+ header { padding: 8px 12px; border-bottom: 1px solid #e5e5e5; display: flex; gap: 14px;
+          align-items: center; flex-wrap: wrap; font-size: 13px; background: #fafafa; }
+ h1 { font-size: 14px; margin: 0 8px 0 0; }
+ #wrap { overflow: auto; max-height: calc(100vh - 92px); position: relative; }
+ canvas { display: block; width: 100%; cursor: crosshair; }
+ #tip { position: fixed; display: none; background: rgba(20,20,20,.92); color: #fff;
+        padding: 6px 8px; border-radius: 4px; font: 11px ui-monospace, monospace;
+        pointer-events: none; z-index: 10; line-height: 1.45; }
+ #readout { font: 11px ui-monospace, monospace; color: #555; min-width: 190px; }
+ #sel { font: 11px ui-monospace, monospace; color: #145; padding: 2px 12px 6px; }
+ label { font-size: 12px; }
+ button { font-size: 12px; padding: 2px 7px; }
+ .banner { background: #fff3cd; border-bottom: 1px solid #f0d48a; padding: 6px 12px;
+           font-size: 12px; }
+</style></head><body>
+<header>
+  <h1>pipeline viewer</h1>
+  <span id="meta"></span>
+  <button id="zin">+</button><button id="zout">&minus;</button><button id="fit">fit</button>
+  <label><input type="checkbox" id="lane-fwd"> fwd</label>
+  <label><input type="checkbox" id="lane-bwd"> bwd</label>
+  <label><input type="checkbox" id="lane-comm"> comm</label>
+  <label><input type="checkbox" id="lane-other"> other</label>
+  <span id="readout"></span>
+</header>
+<div id="sel"></div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="tip"></div>
+<script>window.__STEP__ = __STEP__;</script>
+<script>__JS__</script>
+</body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter default logging
         sys.stderr.write('%s - %s\n' % (self.address_string(), fmt % args))
@@ -326,6 +370,35 @@ class Handler(BaseHTTPRequestHandler):
                 metric = q.get('metric', ['fwd'])[0]
                 refresh = int(q.get('refresh', [str(REFRESH_SECONDS)])[0])
                 body = render_index(STORE, step, rank, metric, refresh, LABEL).encode()
+                self._send(body, 'text/html; charset=utf-8')
+            elif path.startswith('/trace.json'):
+                all_steps = q.get('all', ['0'])[0] in ('1', 'true', 'yes')
+                if all_steps:
+                    steps = STORE.steps()
+                else:
+                    steps = [int(q.get('step', [STORE.latest_step() or 0])[0])]
+                body = json.dumps(to_perfetto(STORE, steps)).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header(
+                    'Content-Disposition', f'attachment; filename="perf-trace-step{steps[0]}.json"'
+                )
+                self.end_headers()
+                self.wfile.write(body)
+            elif path.startswith('/api/trace'):
+                step = int(q.get('step', [STORE.latest_step() or 0])[0])
+                self._send(json.dumps(trace_json(STORE, step)).encode(), 'application/json')
+            elif path.startswith('/gantt'):
+                step = int(q.get('step', [STORE.latest_step() or 0])[0])
+                js_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), 'perf_trace_viewer.js'
+                )
+                with open(js_path) as fh:
+                    js = fh.read()
+                body = (
+                    INTERACTIVE_HTML.replace('__STEP__', str(step)).replace('__JS__', js)
+                ).encode()
                 self._send(body, 'text/html; charset=utf-8')
             elif path == '/api/latest':
                 steps = STORE.steps()
