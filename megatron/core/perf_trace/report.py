@@ -786,13 +786,10 @@ def draw_pipeline_gantt(
     n_layers = max(1, len(all_names))
     lo, hi = layer_range if layer_range else (0, n_layers - 1)
 
-    span_hint = max(
-        1.0,
-        max(
-            ((store.get(step, rk) or {}).get('phases', {}).get('__end__', 0) / 1e6 for rk in ranks),
-            default=1.0,
-        ),
-    )
+    _spans = [(store.get(step, rk) or {}).get('phases', {}).get('__end__', 0) / 1e6 for rk in ranks]
+    # No 1.0 s floor here: a small step (tens of milliseconds) would then push the label
+    # threshold above every block and silently draw no labels at all.
+    span_hint = max(_spans) if _spans and max(_spans) > 0 else 1.0
     for row, rk in enumerate(ranks):
         rec = store.get(step, rk) or {}
         y0 = (len(ranks) - 1 - row) * row_h  # rank 0 at the top
