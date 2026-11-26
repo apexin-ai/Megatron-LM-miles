@@ -271,12 +271,34 @@ class PerfTracer:
     def mark_layer_backward_start(self, name: str) -> int:
         return self._record('layer_bwd', name)
 
+    def mark_sub_start(self, layer: str, part: str) -> int:
+        """Open a sub-layer span, e.g. the attention or MoE block inside layer ``l12``.
+
+        Layer-level timing says which layer is expensive; this says *what inside it* is, which is
+        the difference between "attention is slow" and "the experts are unbalanced".
+        """
+        return self._record('sub', f'{layer}|{part}:start')
+
+    def mark_sub_end(self, layer: str, part: str) -> int:
+        return self._record('sub', f'{layer}|{part}:end')
+
     def mark_layer_backward_end(self, name: str) -> int:
         return self._record('layer_bwd_end', name)
 
     def mark_a2a(self, name: str, stream: Any = None, layer: Optional[str] = None) -> int:
         """Mark a MoE all-to-all, optionally attributed to the layer that issued it."""
         return self._record('a2a', f'{layer}|{name}' if layer else name, stream=stream)
+
+    def mark_sub_start(self, layer: str, part: str) -> int:
+        """Open a sub-layer span, e.g. the attention or MoE block inside layer ``l12``.
+
+        Layer-level timing says which layer is expensive; this says *what inside it* is, which is
+        the difference between "attention is slow" and "the experts are unbalanced".
+        """
+        return self._record('sub', f'{layer}|{part}:start')
+
+    def mark_sub_end(self, layer: str, part: str) -> int:
+        return self._record('sub', f'{layer}|{part}:end')
 
     def mark_layer_backward_end(self, name: str) -> int:
         """Mark the end of a layer's backward."""
@@ -401,6 +423,8 @@ class PerfTracer:
         open_bwd: Dict[str, float] = {}
         open_a2a: Dict[str, float] = {}
         spans: List[Dict[str, float]] = []
+        subs: List[Dict[str, float]] = []
+        open_sub: Dict[str, float] = {}
         bwd_ends: List[tuple] = []
         open_span: Dict[str, float] = {}
 
@@ -423,6 +447,17 @@ class PerfTracer:
                     slot['fs'] = start
             elif kind == 'layer_bwd_end':
                 bwd_ends.append((name, t))
+            elif kind == 'sub':
+                layer_name, sep, op = name.partition('|')
+                if not sep:
+                    continue
+                key = f'{layer_name}|{op}'
+                if op.endswith(':start'):
+                    open_sub[key[:-6]] = t
+                elif op.endswith(':end') and key[:-4] in open_sub:
+                    st = open_sub.pop(key[:-4])
+                    lname, _, part = key[:-4].partition('|')
+                    subs.append({'l': lname, 'n': part, 's': st * 1000.0, 'd': (t - st) * 1000.0})
             elif kind == 'span':
                 if name.endswith(':start'):
                     open_span[name[:-6]] = t
@@ -476,6 +511,10 @@ class PerfTracer:
         out['layers'] = [
             dict({'n': n}, **{k: int(round(v * 1000)) for k, v in per_layer[n].items()})
             for n in per_layer
+        ]
+        out['subs'] = [
+            {'l': x['l'], 'n': x['n'], 's': int(round(x['s'])), 'd': int(round(x['d']))}
+            for x in subs
         ]
         out['spans'] = [
             {'n': sp['n'], 's': int(round(sp['s'])), 'd': int(round(sp['d']))} for sp in spans

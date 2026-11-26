@@ -12,11 +12,11 @@
   var wrap = document.getElementById('wrap');
 
   var data = null;
-  var lanes = { fwd: true, bwd: true, comm: true, other: true };
+  var lanes = { fwd: true, bwd: true, comm: true, other: true, subs: true };
   var view = { t0: 0, t1: 1 };          // visible time window, microseconds
   var rowsTotal = 0;
   var rowH = 34, gutter = 62, axisH = 26, pad = 6;
-  var laneH = { fwd: 13, bwd: 13, comm: 7, other: 7 };
+  var laneH = { fwd: 13, bwd: 13, comm: 7, other: 7, subs: 11 };
   var drag = null;
   var hover = null;
   var selected = null;
@@ -26,13 +26,14 @@
     bwd: '#54A24B',
     comm: '#F58518',
     other: '#B279A2',
+    subs: '#E45756',
     axis: '#666',
     grid: '#e8e8e8',
     guide: '#c33'
   };
 
   function laneList() {
-    return ['fwd', 'bwd', 'comm', 'other'].filter(function (k) { return lanes[k]; });
+    return ['fwd', 'bwd', 'comm', 'other', 'subs'].filter(function (k) { return lanes[k]; });
   }
 
   function rowHeight() {
@@ -320,7 +321,7 @@
     setView(mid - span / 2, mid + span / 2);
   };
   document.getElementById('fit').onclick = function () { setView(0, data.duration_us); };
-  ['fwd', 'bwd', 'comm', 'other'].forEach(function (k) {
+  ['fwd', 'bwd', 'comm', 'other', 'subs'].forEach(function (k) {
     var el = document.getElementById('lane-' + k);
     el.checked = lanes[k];
     el.onchange = function () { lanes[k] = el.checked; resize(); };
