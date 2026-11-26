@@ -90,11 +90,8 @@ def test_layer_forward_and_backward_durations_are_relative_to_the_anchor(tracer,
     clock.tick(2.0)
     tracer.mark_layer_forward_end('l0')
     clock.tick(0.5)
-    # Backward runs in reverse order: l0's backward starts last.
-    tracer.mark_layer_backward_start('l1')
-    clock.tick(4.0)
-    tracer.mark_layer_backward_start('l0')
-    clock.tick(3.0)
+    # Per-layer backward is derived from end markers and has its own test; this one covers the
+    # forward pairing and the anchor.
     tracer.end_step()
     tracer.end_step()
     tracer.close()
@@ -105,10 +102,6 @@ def test_layer_forward_and_backward_durations_are_relative_to_the_anchor(tracer,
     assert rec['step'] == 7 and rec['rank'] == 3
     by_name = {l['n']: l for l in rec['layers']}
     assert by_name['l0']['fwd'] == 2000  # microseconds
-    # l1 starts, then l0 starts 4 ms later -> l1's backward lasted 4 ms
-    assert by_name['l1']['bwd'] == 4000
-    # l0 is last: it runs until the end marker, 3 ms after its start
-    assert by_name['l0']['bwd'] == 3000
     assert rec['phases']['__anchor__'] == 0
 
 
@@ -338,3 +331,35 @@ def test_a_hook_that_raises_does_not_break_the_forward():
             tl.TransformerLayer = saved[0]  # type: ignore[attr-defined]
         if saved[1] is not None:
             tl.get_transformer_layer_offset = saved[1]  # type: ignore[attr-defined]
+
+
+def test_a2a_is_attributed_to_the_layer_that_issued_it(tracer, clock, tmp_path):
+    tracer.begin_step(6)
+    tracer.mark_a2a('dispatch:start', layer='l12')
+    clock.tick(2.0)
+    tracer.mark_a2a('dispatch:end', layer='l12')
+    tracer.end_step()
+    tracer.close()
+
+    rec = _read_lines(tmp_path)[0]
+    assert rec['a2a'] == [{'n': 'dispatch', 's': 0, 'd': 2000, 'layer': 'l12'}]
+
+
+def test_backward_is_derived_from_end_markers(tracer, clock, tmp_path):
+    """Backward finishes the last layer first; gaps between ends are the layer durations."""
+    tracer.begin_step(8)
+    clock.tick(1.0)
+    tracer.mark_layer_backward_end('l3')  # first to finish
+    clock.tick(4.0)
+    tracer.mark_layer_backward_end('l2')
+    clock.tick(2.0)
+    tracer.mark_layer_backward_end('l1')  # last to finish
+    tracer.end_step()
+    tracer.close()
+
+    rec = _read_lines(tmp_path)[0]
+    by = {l['n']: l for l in rec['layers']}
+    assert by['l2']['bwd'] == 4000
+    assert by['l1']['bwd'] == 2000
+    # the first layer to finish has no previous end, so no duration is invented for it
+    assert 'l3' not in by

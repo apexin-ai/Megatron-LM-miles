@@ -147,6 +147,30 @@ def main():
                 f'({totals_by_rank[worst_rank_idx]:.3f} s vs median rank {med_rank:.3f} s)'
             )
 
+    a2a_layers = store.a2a_by_layer(step)
+    if a2a_layers:
+        print()
+        print(f'=== step {step}: all-to-all per layer (mean over ranks) ===')
+        for name, secs in sorted(a2a_layers.items(), key=lambda kv: -kv[1])[: args.top]:
+            print(f'  {name:>12} {secs:8.4f} s')
+
+    # per-layer backward, when the module hooks managed to record it
+    bwd_names, bwd_ranks, bwd_matrix = store.layer_matrix(step, 'bwd')
+    if bwd_names:
+        import statistics
+
+        per_layer_bwd = []
+        for j, name in enumerate(bwd_names):
+            col = [row[j] for row in bwd_matrix if row[j] == row[j]]
+            if col:
+                per_layer_bwd.append((name, statistics.median(col)))
+        if per_layer_bwd:
+            per_layer_bwd.sort(key=lambda x: -x[1])
+            print()
+            print(f'=== step {step}: most expensive layers (backward) ===')
+            for name, med in per_layer_bwd[: args.top]:
+                print(f'  {name:>12} {med:8.4f} s')
+
     cpu = [r for r in rows if r['step'] == step]
     if cpu and cpu[0].get('cpu'):
         print()

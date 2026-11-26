@@ -44,7 +44,8 @@ relative to the step's anchor unless noted.
 | `layers[].fwd` | per transformer layer forward | CUDA events around the module's forward |
 | `layers[].n` | **global** layer id (pipeline-offset included) | `get_transformer_layer_offset(config, vp_stage)` |
 | `lN#recompute` | the second forward of a checkpointed layer | tagged instead of overwriting the first |
-| `a2a` | MoE `dispatch` / `combine` on the comm stream | dispatcher `*_preprocess/postprocess`, class discovered |
+| `layers[].bwd` | per layer backward | derived from module backward **end** markers (see limits) |
+| `a2a` | MoE `dispatch` / `combine` on the comm stream, **attributed to the issuing layer** | dispatcher `*_preprocess/postprocess`, class discovered, current-layer stack |
 | `spans` | named GPU regions, e.g. `optimizer` | `with perf_trace.phase('optimizer'): ...` |
 | `cpu` | Megatron timer values (host-measured) | `forward/backward-compute`, `params-all-gather`, `optimizer-*` |
 | `data` | host-side batch fetch, per `next()` | a transparent iterator proxy |
@@ -84,7 +85,11 @@ tools/analyze_profile.py compare --a <a> --b <b>
 | `/png/heatmap?step=N&metric=fwd\|bwd` | rank x layer: a hot **column** is a fixed layer cost, a hot **row** is a straggler |
 | `/png/layers?rank=R` | one rank's per-layer distribution over the sampled steps |
 
-**Reading imbalance**: `max / median` per step. ≈1.0 is level; 1.3 means the slowest rank spends
+The text report adds two per-layer breakdowns the charts do not show: **all-to-all by layer**
+(which layer's dispatch is expensive, which separates an expert-load problem from a kernel
+problem) and **backward by layer** (ordinal).
+
+**Reading imbalance**: start with `max / median` per step. ≈1.0 is level; 1.3 means the slowest rank spends
 30% longer than the median rank — time every other rank then waits for in the next collective.
 `perf_trace_summary.py` prints this ratio and labels it level / slight / notable / SEVERE.
 
@@ -139,11 +144,13 @@ tools/check_perf_trace_parallel.py --dir <dir> --world 8 --tp 1 --pp 1 --ep 2 \
 
 ## 6. Known limitations
 
-* **Per-layer backward is not recorded.** `register_full_backward_hook` fires at points that do
-  not bracket a layer's backward (measured: 20 us spans for a millisecond-scale layer), and the
-  tensor-hook alternative only fired for one of four layers with Transformer Engine. Use
-  `cpu['backward-compute']` for the total, and the per-layer *forward* plus the A2A/optimizer
-  spans to locate a slow rank. Do not trust a `bwd` field if one appears: it is best-effort.
+* **Per-layer backward is derived, not bracketed.** `register_full_backward_hook` fires at points
+  that do not bracket a layer's backward (measured: a 20 us span for a millisecond-scale layer),
+  so `bwd` is computed from the *end* markers instead: backward finishes the last layer first, so
+  sorting the end times and taking consecutive gaps gives each layer's duration. The first layer
+  to finish has no previous end and is therefore reported without `bwd`; the total stays available
+  as `cpu['backward-compute']`. Treat per-layer `bwd` as ordinal (which layer is expensive), not
+  as an exact breakdown.
 * **A2A spans appear at EP=1 too** (the dispatcher runs, with a group of size one), so presence
   is not evidence that expert parallelism is on.
 * **No rotation/compression** of the JSONL yet: 256 ranks x ~6 KB/step is ~0.5 GB/day at one line
