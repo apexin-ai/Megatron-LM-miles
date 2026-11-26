@@ -69,6 +69,8 @@ draw_step_timeline = _report.draw_step_timeline
 draw_step_trends = _report.draw_step_trends
 draw_layer_start_heatmap = _report.draw_layer_start_heatmap
 draw_overlap = _report.draw_overlap
+draw_pipeline_gantt = _report.draw_pipeline_gantt
+comm_overlap_stats = _report.comm_overlap_stats
 
 STORE: TraceStore = None  # set in main()
 LABEL = ''
@@ -91,6 +93,14 @@ def _chart(store: TraceStore, kind: str, q: dict) -> bytes:
     if kind == 'heatmap':
         metric = q.get('metric', ['fwd'])[0]
         return draw_layer_heatmap(store, step, metric)
+    if kind == 'gantt':
+        rng = q.get('layers', [None])[0]
+        layer_range = None
+        if rng and '-' in rng:
+            a, b = rng.split('-', 1)
+            layer_range = (int(a), int(b))
+        rank = int(q['rank'][0]) if 'rank' in q else None
+        return draw_pipeline_gantt(store, step, layer_range=layer_range, rank=rank)
     if kind == 'starts':
         metric = q.get('metric', ['fwd_start'])[0]
         return draw_layer_start_heatmap(store, step, metric)
@@ -193,6 +203,17 @@ def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
     ]
     a2a_table = _table(['layer', 'a2a s (mean/rank)'], a2a_rows) if a2a_rows else '<i>none</i>'
 
+    overlap = comm_overlap_stats(store, step)
+    ov_rows = [
+        [rk, f"{v['comm_s'] * 1e3:.1f}", f"{v['overlap_s'] * 1e3:.1f}", f"{v['overlap_pct']:.0f}%"]
+        for rk, v in sorted(overlap.items())
+    ]
+    ov_table = (
+        _table(['rank', 'a2a ms', 'inside compute ms', 'inside %'], ov_rows)
+        if ov_rows
+        else '<i>none</i>'
+    )
+
     cpu_rows = []
     if rows:
         cpu = next((r for r in rows if r['step'] == step), None)
@@ -244,8 +265,11 @@ def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
 <div class="cols">
  <div><h2>slowest ranks</h2>{rank_table}</div>
  <div><h2>all-to-all by layer</h2>{a2a_table}</div>
+ <div><h2>comm overlap</h2>{ov_table}</div>
  <div><h2>phase timers</h2>{cpu_table}</div>
 </div>
+<h2>per-rank pipeline &mdash; every layer at its real start/end (the main view)</h2>
+<img src="/png/gantt?step={step}&t={os.getpid()}" width="1300">
 <h2>when each rank started each layer &mdash; a bright row is a late rank, a bright cell is a late layer</h2>
 <img src="/png/starts?step={step}&t={os.getpid()}" width="1250">
 <h2>rank {rank}: compute vs comm, the gaps are the point</h2>

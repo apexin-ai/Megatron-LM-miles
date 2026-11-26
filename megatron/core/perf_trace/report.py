@@ -541,6 +541,208 @@ def draw_overlap(store: TraceStore, step: int, rank: int) -> bytes:
     return _png(fig)
 
 
+def comm_overlap_stats(store: TraceStore, step: int) -> Dict[int, Dict[str, float]]:
+    """Per rank: how much of the all-to-all time actually overlapped compute.
+
+    This is the number behind "is comm overlapped": 100% means every comm second was hidden
+    behind compute, 0% means the rank sat idle waiting for the network.
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    for rank in store.ranks(step):
+        rec = store.get(step, rank) or {}
+        compute = []
+        for layer in rec.get('layers', []):
+            if 'fs' in layer and layer.get('fwd'):
+                compute.append((layer['fs'], layer['fs'] + layer['fwd']))
+            if 'bs' in layer and layer.get('bwd'):
+                compute.append((layer['bs'], layer['bs'] + layer['bwd']))
+        comm = [(a['s'], a['s'] + a['d']) for a in rec.get('a2a', [])]
+        comm_total = _union_us(comm)
+        overlap = _intersection_us(compute, comm)
+        out[rank] = {
+            'comm_s': comm_total / 1e6,
+            'overlap_s': overlap / 1e6,
+            'overlap_pct': (100.0 * overlap / comm_total) if comm_total else 0.0,
+        }
+    return out
+
+
+def _union_us(intervals):
+    if not intervals:
+        return 0.0
+    ivs = sorted(intervals)
+    total = 0.0
+    a, b = ivs[0]
+    for x, y in ivs[1:]:
+        if x > b:
+            total += b - a
+            a, b = x, y
+        else:
+            b = max(b, y)
+    return total + (b - a)
+
+
+def _intersection_us(a_ivs, b_ivs):
+    if not a_ivs or not b_ivs:
+        return 0.0
+    a = sorted(a_ivs)
+    b = sorted(b_ivs)
+    i = j = 0
+    total = 0.0
+    while i < len(a) and j < len(b):
+        lo = max(a[i][0], b[j][0])
+        hi = min(a[i][1], b[j][1])
+        if hi > lo:
+            total += hi - lo
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def draw_pipeline_gantt(
+    store: TraceStore,
+    step: int,
+    layer_range: Tuple[int, int] = None,
+    max_ranks: int = None,
+    rank: int = None,
+) -> bytes:
+    """One row per rank, every layer drawn at its real start and end.
+
+    Three lanes per rank:
+
+    * **forward** (top): each layer a block, coloured by layer index so the sequence is readable
+      and a repeated layer (recompute) is obvious;
+    * **backward** (middle): same colouring, running in reverse order;
+    * **comm** (bottom, thin): the all-to-all where it actually ran, so an orange block inside a
+      compute block means overlapped and an orange block alone in a gap means exposed.
+
+    Gaps between the end of a block and the start of the next are drawn as the background, which
+    is exactly the idle time this chart exists to show.
+    """
+    import matplotlib.patches as mpatches
+    from matplotlib import colormaps
+
+    plt = _plt()
+    ranks = [rank] if rank is not None else store.ranks(step)
+    if max_ranks:
+        ranks = ranks[:max_ranks]
+    if not ranks:
+        raise ValueError(f'no records for step {step}')
+
+    stats = comm_overlap_stats(store, step)
+    row_h = 1.0
+    fig_h = max(2.4, row_h * len(ranks) + 1.8)
+    fig, ax = plt.subplots(figsize=(16, fig_h))
+    cmap = colormaps['viridis']
+
+    # layer index -> colour; layer names look like "l12" or "l12#recompute"
+    all_names = []
+    for rk in ranks:
+        for layer in (store.get(step, rk) or {}).get('layers', []):
+            if layer['n'] not in all_names:
+                all_names.append(layer['n'])
+    order = {n: i for i, n in enumerate(all_names)}
+    n_layers = max(1, len(all_names))
+    lo, hi = layer_range if layer_range else (0, n_layers - 1)
+
+    for row, rk in enumerate(ranks):
+        rec = store.get(step, rk) or {}
+        y0 = (len(ranks) - 1 - row) * row_h  # rank 0 at the top
+        for layer in rec.get('layers', []):
+            idx = order.get(layer['n'], 0)
+            if not (lo <= idx <= hi):
+                continue
+            colour = cmap(idx / max(1, n_layers - 1))
+            if 'fs' in layer:
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (layer['fs'] / 1e6, y0 + 0.62),
+                        max(layer.get('fwd', 0) / 1e6, 1e-5),
+                        0.26,
+                        facecolor=colour,
+                        edgecolor='white',
+                        linewidth=0.2,
+                    )
+                )
+            if 'bs' in layer:
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (layer['bs'] / 1e6, y0 + 0.32),
+                        max(layer.get('bwd', 0) / 1e6, 1e-5),
+                        0.26,
+                        facecolor=colour,
+                        edgecolor='white',
+                        linewidth=0.2,
+                    )
+                )
+        for a in rec.get('a2a', []):
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (a['s'] / 1e6, y0 + 0.06),
+                    max(a['d'] / 1e6, 1e-5),
+                    0.18,
+                    facecolor=_DEFAULT_COLORS['a2a'],
+                    edgecolor='none',
+                )
+            )
+        for sp in rec.get('spans', []):
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (sp['s'] / 1e6, y0 + 0.06),
+                    max(sp['d'] / 1e6, 1e-5),
+                    0.18,
+                    facecolor=_DEFAULT_COLORS['span'],
+                    edgecolor='none',
+                    alpha=0.9,
+                )
+            )
+        ov = stats.get(rk, {})
+        ax.text(
+            -0.004 * max(1e-6, _row_end(rec)),
+            y0 + 0.5,
+            f"r{rk}",
+            ha='right',
+            va='center',
+            fontsize=7,
+        )
+        if ov:
+            ax.text(
+                _row_end(rec) * 1.0,
+                y0 + 0.5,
+                f" a2a {ov['comm_s'] * 1e3:.1f}ms overlapped {ov['overlap_pct']:.0f}%",
+                ha='left',
+                va='center',
+                fontsize=6,
+                color='#666',
+            )
+
+    ax.set_xlabel('time since step anchor (s)')
+    ax.set_ylabel('rank')
+    ax.set_yticks([(len(ranks) - 1 - i) * row_h + 0.5 for i in range(len(ranks))])
+    ax.set_yticklabels([f'r{rk}' for rk in ranks], fontsize=7)
+    ax.set_ylim(-0.1, len(ranks) * row_h + 0.1)
+    ax.set_title(
+        f'step {step}: per-rank pipeline, every layer at its real start/end  '
+        f'(top lane=fwd, middle=bwd, colour=layer index; bottom=comm purple=optimizer)'
+    )
+    ax.grid(axis='x', alpha=0.25)
+    fig.tight_layout()
+    return _png(fig)
+
+
+def _row_end(rec) -> float:
+    end = rec.get('phases', {}).get('__end__', 0) / 1e6
+    if end:
+        return end
+    last = 0.0
+    for layer in rec.get('layers', []):
+        last = max(last, (layer.get('fs', 0) + layer.get('fwd', 0)) / 1e6)
+        last = max(last, (layer.get('bs', 0) + layer.get('bwd', 0)) / 1e6)
+    return last or 1.0
+
+
 def draw_layer_distribution(
     store: TraceStore, steps: List[int], rank: int = 0, metric: str = 'fwd'
 ) -> bytes:
