@@ -333,6 +333,23 @@ def wrap_data_iterator(data_iterator: Any) -> Any:
     return tracer.wrap_data_iterator(data_iterator)
 
 
+def parse_rank_spec(spec: str) -> Optional[set]:
+    """Parse "0,7,10-20" into a set of ranks; empty means "every rank"."""
+    if not spec or not spec.strip():
+        return None
+    out = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
 def maybe_install(args: Any, model_chunks: List[Any]) -> Optional[Any]:
     """Install the tracer if ``--perf-trace-dir`` is set. Returns the tracer (or None)."""
     global TRACER
@@ -346,6 +363,10 @@ def maybe_install(args: Any, model_chunks: List[Any]) -> Optional[Any]:
     from .tracer import PerfTracer
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    selected = parse_rank_spec(getattr(args, 'perf_trace_ranks', '') or '')
+    if selected is not None and rank not in selected:
+        return None
     tracer = PerfTracer(
         out_dir=out_dir,
         rank=rank,
@@ -355,13 +376,16 @@ def maybe_install(args: Any, model_chunks: List[Any]) -> Optional[Any]:
     tracer.start()
     n_layers = install_layer_hooks(tracer, model_chunks, tracer.max_layers)
     n_a2a = install_a2a_hooks(tracer)
-    if rank == 0:
-        logger.info(
-            'perf-trace: writing to %s every %d step(s); %d layers, %d A2A hooks',
-            out_dir,
-            tracer.every_n_steps,
-            n_layers,
-            n_a2a,
-        )
+    logger.info(
+        'perf-trace: rank %d/%d -> %s/perf-rank-%d.jsonl every %d step(s); '
+        '%d layer(s), %d A2A hook(s)',
+        rank,
+        world,
+        out_dir,
+        rank,
+        tracer.every_n_steps,
+        n_layers,
+        n_a2a,
+    )
     TRACER = tracer
     return tracer

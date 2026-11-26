@@ -379,3 +379,55 @@ def test_layer_start_offsets_are_recorded(tracer, clock, tmp_path):
     assert layer['n'] == 'l2'
     assert layer['fs'] == 5000  # microseconds since anchor
     assert layer['fwd'] == 2000
+
+
+def test_each_rank_writes_its_own_file_with_start_offsets(tmp_path, clock):
+    """Every rank reports independently: one file per rank, each with its own layer starts."""
+    import megatron.core.perf_trace.tracer as tr
+
+    for rank in (0, 1):
+        t = tr.PerfTracer(
+            out_dir=str(tmp_path),
+            rank=rank,
+            every_n_steps=1,
+            event_factory=lambda: FakeEvent(clock),
+            clock=lambda: 0.0,
+        )
+        t.start()
+        t.begin_step(1)
+        clock.tick(2.0 + rank)  # rank 1 starts slightly later
+        t.mark_layer_forward_start('l0')
+        clock.tick(3.0)
+        t.mark_layer_forward_end('l0')
+        t.end_step()
+        t.close()
+
+    for rank in (0, 1):
+        path = os.path.join(str(tmp_path), f'perf-rank-{rank}.jsonl')
+        rec = json.loads(open(path).read().strip())
+        assert rec['rank'] == rank
+        layer = rec['layers'][0]
+        assert layer['fs'] == int((2.0 + rank) * 1000), f'rank {rank} start offset wrong'
+        assert layer['fwd'] == 3000
+
+
+class TestRankSpec:
+    """The rank selector decides who installs anything at all."""
+
+    def test_empty_means_every_rank(self):
+        from megatron.core.perf_trace.hooks import parse_rank_spec
+
+        assert parse_rank_spec('') is None
+        assert parse_rank_spec('   ') is None
+
+    def test_list_and_ranges(self):
+        from megatron.core.perf_trace.hooks import parse_rank_spec
+
+        assert parse_rank_spec('0,7,10-12') == {0, 7, 10, 11, 12}
+
+    def test_all_ranks_selected_by_default(self):
+        from megatron.core.perf_trace.hooks import parse_rank_spec
+
+        selected = parse_rank_spec('')
+        for rank in range(256):
+            assert selected is None or rank in selected
