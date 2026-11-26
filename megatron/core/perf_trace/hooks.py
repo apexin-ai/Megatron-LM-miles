@@ -153,6 +153,41 @@ def install_layer_hooks(tracer: Any, model_chunks: List[Any], max_layers: int = 
 
                 tensor.register_hook(_bwd_marker)
 
+        # Sub-layer hooks: attention, mlp/moe and the two norms. These are plain forward hooks
+        # on the children, so they cost the same per-boundary as the layer hooks.
+        subs = [
+            ('input_layernorm', 'norm1'),
+            ('self_attention', 'attn'),
+            ('pre_mlp_layernorm', 'norm2'),
+        ]
+        mlp = getattr(layer, 'mlp', None)
+        if mlp is not None:
+            subs.append(('mlp', 'moe' if type(mlp).__name__ == 'MoELayer' else 'mlp'))
+        for attr, part in subs:
+            child = getattr(layer, attr, None)
+            if child is None:
+                continue
+
+            def _sub_pre(_m, _a, _n=name, _p=part):
+                try:
+                    tracer.mark_sub_start(_n, _p)
+                except Exception:
+                    _warn_once('hook-sub-pre', 'perf-trace: sub pre-hook failed for %s/%s', _n, _p)
+
+            def _sub_post(_m, _a, _o, _n=name, _p=part):
+                try:
+                    tracer.mark_sub_end(_n, _p)
+                except Exception:
+                    _warn_once(
+                        'hook-sub-post', 'perf-trace: sub post-hook failed for %s/%s', _n, _p
+                    )
+
+            try:
+                child.register_forward_pre_hook(_sub_pre)
+                child.register_forward_hook(_sub_post)
+            except Exception:
+                _warn_once('hook-sub-reg', 'perf-trace: cannot hook %s of %s', attr, name)
+
         try:
             layer.register_forward_pre_hook(_fwd_pre)
             layer.register_forward_hook(_fwd_post)

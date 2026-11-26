@@ -431,3 +431,23 @@ class TestRankSpec:
         selected = parse_rank_spec('')
         for rank in range(256):
             assert selected is None or rank in selected
+
+
+def test_sub_layer_spans_are_recorded_per_part(tracer, clock, tmp_path):
+    """A layer is not one cost: attention, the MoE block and the norms are timed separately."""
+    tracer.begin_step(11)
+    clock.tick(1.0)
+    tracer.mark_sub_start('l3', 'attn')
+    clock.tick(2.0)
+    tracer.mark_sub_end('l3', 'attn')
+    tracer.mark_sub_start('l3', 'moe')
+    clock.tick(5.0)
+    tracer.mark_sub_end('l3', 'moe')
+    tracer.end_step()
+    tracer.close()
+
+    rec = _read_lines(tmp_path)[0]
+    subs = {f"{x['l']}/{x['n']}": x for x in rec['subs']}
+    assert subs['l3/attn']['d'] == 2000
+    assert subs['l3/moe']['d'] == 5000
+    assert subs['l3/moe']['s'] == 3000  # microseconds since the anchor

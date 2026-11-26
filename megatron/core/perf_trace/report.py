@@ -561,6 +561,10 @@ def trace_json(store: TraceStore, step: int) -> dict:
             for a in rec.get('a2a', [])
         ]
         other = [{'n': sp['n'], 's': sp['s'], 'd': sp['d']} for sp in rec.get('spans', [])]
+        subs = [
+            {'n': f"{x['l']}/{x['n']}", 's': x['s'], 'd': x['d'], 'part': x['n']}
+            for x in rec.get('subs', [])
+        ]
         ranks.append(
             {
                 'rank': rank,
@@ -569,6 +573,7 @@ def trace_json(store: TraceStore, step: int) -> dict:
                 'bwd': bwd,
                 'comm': comm,
                 'other': other,
+                'subs': subs,
             }
         )
     duration = max((r['end'] for r in ranks), default=0) or 1
@@ -579,8 +584,15 @@ def trace_json(store: TraceStore, step: int) -> dict:
 # Perfetto's UI (ui.perfetto.dev, Apache-2.0) reads Chrome Trace Event JSON. Emitting that
 # format gives the whole Perfetto experience -- zoom, pan, per-slice duration, search, SQL --
 # without writing a viewer. Tracks are (pid=rank, tid=lane), which is exactly our data model.
-_PERFETTO_TIDS = {'fwd': 1, 'bwd': 2, 'comm': 3, 'other': 4, 'step': 5}
-_PERFETTO_TID_NAMES = {1: 'forward', 2: 'backward', 3: 'comm', 4: 'optimizer/other', 5: 'step'}
+_PERFETTO_TIDS = {'fwd': 1, 'bwd': 2, 'comm': 3, 'other': 4, 'step': 5, 'sub': 6}
+_PERFETTO_TID_NAMES = {
+    1: 'forward',
+    2: 'backward',
+    3: 'comm',
+    4: 'optimizer/other',
+    5: 'step',
+    6: 'attention / mlp / norm',
+}
 
 
 def to_perfetto(store: TraceStore, steps: Optional[List[int]] = None) -> dict:
@@ -622,6 +634,30 @@ def to_perfetto(store: TraceStore, steps: Optional[List[int]] = None) -> dict:
                             'args': {'step': step, 'layer': layer['n'], 'lane': lane},
                         }
                     )
+            for x in rec.get('subs', []):
+                events.append(
+                    {
+                        'ph': 'X',
+                        'name': f"{x['l']}/{x['n']}",
+                        'pid': rank,
+                        'tid': _PERFETTO_TIDS['sub'],
+                        'ts': offset + x['s'],
+                        'dur': x['d'],
+                        'args': {'step': step, 'layer': x['l'], 'part': x['n']},
+                    }
+                )
+            for x in rec.get('subs', []):
+                events.append(
+                    {
+                        'ph': 'X',
+                        'name': f"{x['l']}/{x['n']}",
+                        'pid': rank,
+                        'tid': _PERFETTO_TIDS['sub'],
+                        'ts': offset + x['s'],
+                        'dur': x['d'],
+                        'args': {'step': step, 'layer': x['l'], 'part': x['n']},
+                    }
+                )
             for a in rec.get('a2a', []):
                 events.append(
                     {
@@ -678,6 +714,21 @@ def to_perfetto(store: TraceStore, steps: Optional[List[int]] = None) -> dict:
         'displayTimeUnit': 'ms',
         'metadata': {'source': 'megatron perf_trace', 'steps': list(steps)},
     }
+
+
+def sub_breakdown(store: TraceStore, step: int) -> Dict[str, Dict[str, float]]:
+    """Per layer: median time spent in each sub-block, across ranks (seconds)."""
+    import statistics
+
+    acc: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    for rank in store.ranks(step):
+        rec = store.get(step, rank) or {}
+        for x in rec.get('subs', []):
+            acc[x['l']][x['n']].append(x['d'])
+    out: Dict[str, Dict[str, float]] = {}
+    for layer, parts in acc.items():
+        out[layer] = {p: statistics.median(v) / 1e6 for p, v in parts.items()}
+    return out
 
 
 def comm_overlap_stats(store: TraceStore, step: int) -> Dict[int, Dict[str, float]]:

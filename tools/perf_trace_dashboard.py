@@ -72,6 +72,7 @@ draw_overlap = _report.draw_overlap
 draw_pipeline_gantt = _report.draw_pipeline_gantt
 trace_json = _report.trace_json
 to_perfetto = _report.to_perfetto
+sub_breakdown = _report.sub_breakdown
 comm_overlap_stats = _report.comm_overlap_stats
 
 STORE: TraceStore = None  # set in main()
@@ -205,6 +206,19 @@ def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
     ]
     a2a_table = _table(['layer', 'a2a s (mean/rank)'], a2a_rows) if a2a_rows else '<i>none</i>'
 
+    bd = sub_breakdown(store, step)
+    if bd:
+        parts = sorted({p for v in bd.values() for p in v})
+        bd_rows = []
+        for layer in sorted(bd, key=lambda k: int(k[1:]) if k[1:].isdigit() else 0):
+            row = [layer] + [
+                f'{bd[layer].get(p, 0) * 1e3:.2f}' if p in bd[layer] else '-' for p in parts
+            ]
+            bd_rows.append(row)
+        sub_table = _table([f'layer (ms)'] + parts, bd_rows)
+    else:
+        sub_table = '<i>no sub-layer spans in this data (older tracer)</i>'
+
     overlap = comm_overlap_stats(store, step)
     ov_rows = [
         [rk, f"{v['comm_s'] * 1e3:.1f}", f"{v['overlap_s'] * 1e3:.1f}", f"{v['overlap_pct']:.0f}%"]
@@ -285,6 +299,8 @@ def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
  <div><h2>rank x layer ({metric})</h2>
    <img src="/png/heatmap?step={step}&metric={metric}&t={os.getpid()}" width="620"></div>
 </div>
+<h2>inside each layer: attention / mlp-or-moe / norms (ms, median over ranks)</h2>
+{sub_table}
 <h2>most expensive layers ({metric})</h2>{layer_table}
 <h2>per-layer distribution (rank {rank})</h2>
 <img src="/png/layers?rank={rank}&metric={metric}&t={os.getpid()}" width="1150">
@@ -334,6 +350,7 @@ INTERACTIVE_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <label><input type="checkbox" id="lane-bwd"> bwd</label>
   <label><input type="checkbox" id="lane-comm"> comm</label>
   <label><input type="checkbox" id="lane-other"> other</label>
+  <label><input type="checkbox" id="lane-subs"> attn/moe/norm</label>
   <span id="readout"></span>
 </header>
 <div id="sel"></div>
