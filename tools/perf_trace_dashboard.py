@@ -71,6 +71,7 @@ draw_layer_start_heatmap = _report.draw_layer_start_heatmap
 draw_overlap = _report.draw_overlap
 
 STORE: TraceStore = None  # set in main()
+LABEL = ''
 REFRESH_SECONDS = 5.0
 
 
@@ -138,7 +139,7 @@ def _table(headers, rows, left_cols=1):
     return ''.join(out)
 
 
-def render_index(store, step, rank, metric, refresh_seconds=15):
+def render_index(store, step, rank, metric, refresh_seconds=15, label=''):
     """Build the dashboard page: numbers first, then the charts for the chosen step."""
     rows = store.summary()
     steps = [r['step'] for r in rows]
@@ -210,9 +211,16 @@ def render_index(store, step, rank, metric, refresh_seconds=15):
         f'<option value="{m}"{" selected" if m == metric else ""}>{m}</option>'
         for m in ('fwd', 'bwd')
     )
+    banner = (
+        f'<div class="warn" style="border:2px solid #c33;padding:8px;margin:8px 0">'
+        f'{html.escape(label)}</div>'
+        if label
+        else ''
+    )
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>training perf</title><style>{PAGE_CSS}</style></head><body>
 <h1>training performance</h1>
+{banner}
 <div class="meta">dir: {html.escape(store.dirpath)} &nbsp;|&nbsp; steps: {len(steps)}
  &nbsp;|&nbsp; latest: {steps[-1] if steps else '-'}</div>
 <form method="get" action="/">
@@ -293,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                 rank = int(q.get('rank', ['0'])[0])
                 metric = q.get('metric', ['fwd'])[0]
                 refresh = int(q.get('refresh', [str(REFRESH_SECONDS)])[0])
-                body = render_index(STORE, step, rank, metric, refresh).encode()
+                body = render_index(STORE, step, rank, metric, refresh, LABEL).encode()
                 self._send(body, 'text/html; charset=utf-8')
             elif path == '/api/latest':
                 steps = STORE.steps()
@@ -383,6 +391,12 @@ def main():
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--max-steps', type=int, default=4096)
     ap.add_argument(
+        '--label',
+        default='',
+        help='banner shown at the top of the page, e.g. a warning that the directory holds '
+        'synthetic demo data instead of a real run',
+    )
+    ap.add_argument(
         '--refresh-seconds',
         type=int,
         default=15,
@@ -393,7 +407,8 @@ def main():
     ap.add_argument('--out', default='perf_report.html')
     args = ap.parse_args()
 
-    global REFRESH_SECONDS
+    global REFRESH_SECONDS, LABEL
+    LABEL = args.label
     REFRESH_SECONDS = args.refresh_seconds
     STORE = TraceStore(args.dir, max_steps=args.max_steps)
     added = STORE.refresh()
