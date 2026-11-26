@@ -4214,6 +4214,27 @@ def _add_distributed_args(parser):
         help='If set, overlap param all-gather of first bucket with optimizer step.',
     )
     group.add_argument(
+        '--perf-trace-dir',
+        type=str,
+        default=None,
+        help='Write one JSON line per tracked step per rank with the GPU timeline of every '
+        'transformer layer, the MoE all-to-all, the phases and the host-side data fetch. '
+        'Opt-in and designed to be left on: it records CUDA events only (no synchronize, no '
+        'profiler) and writes from a background thread.',
+    )
+    group.add_argument(
+        '--perf-trace-every-n-steps',
+        type=int,
+        default=1,
+        help='Sample one step in N for --perf-trace-dir (default 1 = every step).',
+    )
+    group.add_argument(
+        '--perf-trace-max-layers',
+        type=int,
+        default=256,
+        help='Upper bound on instrumented transformer layers for --perf-trace-dir.',
+    )
+    group.add_argument(
         '--dedupe-chained-param-sync',
         action='store_true',
         default=False,

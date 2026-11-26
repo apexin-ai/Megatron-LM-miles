@@ -41,7 +41,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
-from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core import mpu, nccl_allocator, perf_trace, tensor_parallel
 from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -1628,6 +1628,9 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
 
+    # Opt-in GPU timeline capture; installs nothing unless --perf-trace-dir is set.
+    perf_trace.maybe_install(args, model)
+
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
@@ -2753,6 +2756,9 @@ def train_step(
     timers = get_timers()
     num_microbatches = get_num_microbatches()
 
+    # Opt-in GPU timeline capture (--perf-trace-dir); a no-op when it is not set.
+    perf_trace.begin_train_step(iteration)
+
     optimizer_config = getattr(optimizer, 'config', None)
     chunked_optimizer_state_offload = bool(
         optimizer_config is not None
@@ -2912,6 +2918,8 @@ def train_step(
                 ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
+                # Opt-in host-side batch-fetch timing (no-op without --perf-trace-dir).
+                packed_data_iterator = perf_trace.wrap_data_iterator(packed_data_iterator)
             forward_backward_data_iterator = packed_data_iterator
         else:
             num_microbatches = get_num_microbatches()
@@ -3005,7 +3013,8 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    with perf_trace.phase('optimizer'):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -3089,6 +3098,8 @@ def train_step(
             seqlen_sum_this_global_batch,
             seqlen_squared_sum_this_global_batch,
         )
+    perf_trace.capture_timers(timers)
+    perf_trace.end_train_step()
     return (
         {},
         skipped_iter,
