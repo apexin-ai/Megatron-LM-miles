@@ -67,6 +67,8 @@ draw_layer_heatmap = _report.draw_layer_heatmap
 draw_rank_skew = _report.draw_rank_skew
 draw_step_timeline = _report.draw_step_timeline
 draw_step_trends = _report.draw_step_trends
+draw_layer_start_heatmap = _report.draw_layer_start_heatmap
+draw_overlap = _report.draw_overlap
 
 STORE: TraceStore = None  # set in main()
 REFRESH_SECONDS = 5.0
@@ -88,6 +90,12 @@ def _chart(store: TraceStore, kind: str, q: dict) -> bytes:
     if kind == 'heatmap':
         metric = q.get('metric', ['fwd'])[0]
         return draw_layer_heatmap(store, step, metric)
+    if kind == 'starts':
+        metric = q.get('metric', ['fwd_start'])[0]
+        return draw_layer_start_heatmap(store, step, metric)
+    if kind == 'overlap':
+        rank = int(q.get('rank', ['0'])[0])
+        return draw_overlap(store, step, rank)
     if kind == 'layers':
         rank = int(q.get('rank', ['0'])[0])
         metric = q.get('metric', ['fwd'])[0]
@@ -95,38 +103,168 @@ def _chart(store: TraceStore, kind: str, q: dict) -> bytes:
     raise KeyError(kind)
 
 
-INDEX_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>training perf dashboard</title>
-<style>
- body {{ font-family: system-ui, sans-serif; margin: 16px; background: #fafafa; }}
- h1 {{ font-size: 18px; }} h2 {{ font-size: 15px; margin-top: 24px; }}
- .meta {{ color: #555; font-size: 13px; }}
- img {{ max-width: 100%; border: 1px solid #ddd; background: #fff; }}
- form {{ margin: 12px 0; font-size: 14px; }}
- .row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
-</style></head><body>
-<h1>training perf dashboard</h1>
-<div class="meta">dir: {dirpath} &nbsp;|&nbsp; steps: {n_steps} &nbsp;|&nbsp; latest: {latest} &nbsp;|&nbsp;
-refreshes every 5 s</div>
+PAGE_CSS = """
+ body { font-family: system-ui, -apple-system, sans-serif; margin: 18px; background: #fafafa;
+        color: #222; }
+ h1 { font-size: 19px; margin-bottom: 4px; }
+ h2 { font-size: 15px; margin: 26px 0 8px; }
+ .meta { color: #555; font-size: 13px; }
+ table { border-collapse: collapse; font-size: 12px; background: #fff; }
+ th, td { border: 1px solid #e3e3e3; padding: 3px 7px; text-align: right; }
+ th { background: #f2f2f2; font-weight: 600; }
+ td.l, th.l { text-align: left; }
+ img { max-width: 100%; border: 1px solid #ddd; background: #fff; }
+ form { margin: 12px 0; font-size: 14px; }
+ input, select, button { font-size: 13px; padding: 2px 4px; }
+ .warn { color: #c33; font-weight: 600; }
+ .cols { display: flex; gap: 22px; flex-wrap: wrap; align-items: flex-start; }
+"""
+
+
+def _table(headers, rows, left_cols=1):
+    """Minimal HTML table; the first ``left_cols`` columns are left-aligned."""
+    out = ['<table>', '<tr>']
+    for i, h in enumerate(headers):
+        cls = ' class="l"' if i < left_cols else ''
+        out.append(f'<th{cls}>{html.escape(str(h))}</th>')
+    out.append('</tr>')
+    for row in rows:
+        out.append('<tr>')
+        for i, cell in enumerate(row):
+            cls = ' class="l"' if i < left_cols else ''
+            out.append(f'<td{cls}>{html.escape(str(cell))}</td>')
+        out.append('</tr>')
+    out.append('</table>')
+    return ''.join(out)
+
+
+def render_index(store, step, rank, metric, refresh_seconds=15):
+    """Build the dashboard page: numbers first, then the charts for the chosen step."""
+    rows = store.summary()
+    steps = [r['step'] for r in rows]
+
+    step_rows = []
+    for r in rows[-15:]:
+        med = r['total']['median']
+        ratio = (r['total']['max'] / med) if med else 0.0
+        verdict = (
+            'level'
+            if ratio < 1.05
+            else 'slight' if ratio < 1.2 else ('notable' if ratio < 1.5 else 'SEVERE')
+        )
+        cls = ' class="warn"' if verdict == 'SEVERE' else ''
+        step_rows.append(
+            [
+                r['step'],
+                r['ranks'],
+                f"{med:.2f}",
+                f"{r['total']['min']:.2f}",
+                f"{r['total']['max']:.2f}",
+                f"{ratio:.2f}",
+                verdict,
+            ]
+        )
+        step_rows[-1][-1] = verdict
+    step_table = _table(
+        ['step', 'ranks', 'median s', 'min s', 'max s', 'max/med', 'verdict'], step_rows
+    )
+
+    rank_rows = [
+        [rk, f'{tot:.2f}', f'{fwd:.2f}', f'{bwd:.2f}', f'{a2a:.2f}']
+        for rk, tot, fwd, bwd, a2a in store.rank_totals(step)[:10]
+    ]
+    rank_table = _table(['rank', 'total s', 'fwd s', 'bwd s', 'a2a s'], rank_rows)
+
+    names, ranks, matrix = store.layer_matrix(step, metric)
+    import statistics
+
+    layer_rows = []
+    for j, name in enumerate(names):
+        col = [row[j] for row in matrix if row[j] == row[j]]
+        if col:
+            layer_rows.append([name, f'{statistics.median(col):.4f}', f'{max(col):.4f}'])
+    layer_rows.sort(key=lambda r: -float(r[1]))
+    layer_table = _table([f'layer ({metric})', 'median s', 'max s'], layer_rows[:10])
+
+    a2a_rows = [
+        [n, f'{v:.4f}']
+        for n, v in sorted(store.a2a_by_layer(step).items(), key=lambda kv: -kv[1])[:10]
+    ]
+    a2a_table = _table(['layer', 'a2a s (mean/rank)'], a2a_rows) if a2a_rows else '<i>none</i>'
+
+    cpu_rows = []
+    if rows:
+        cpu = next((r for r in rows if r['step'] == step), None)
+        if cpu and cpu.get('cpu'):
+            cpu_rows = [
+                [k, f"{v['median']:.2f}"]
+                for k, v in sorted(cpu['cpu'].items(), key=lambda kv: -kv[1]['median'])
+            ]
+    cpu_table = _table(['phase (CPU timer)', 'median s'], cpu_rows) if cpu_rows else '<i>none</i>'
+
+    step_options = ''.join(
+        f'<option value="{s}"{" selected" if s == step else ""}>{s}</option>' for s in steps[-200:]
+    )
+    sel = {v: ' selected' if int(refresh_seconds) == v else '' for v in (0, 5, 15, 60)}
+    metric_options = ''.join(
+        f'<option value="{m}"{" selected" if m == metric else ""}>{m}</option>'
+        for m in ('fwd', 'bwd')
+    )
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>training perf</title><style>{PAGE_CSS}</style></head><body>
+<h1>training performance</h1>
+<div class="meta">dir: {html.escape(store.dirpath)} &nbsp;|&nbsp; steps: {len(steps)}
+ &nbsp;|&nbsp; latest: {steps[-1] if steps else '-'}</div>
 <form method="get" action="/">
-  <label>step <input name="step" value="{latest}" size="8"></label>
-  <label>rank <input name="rank" value="0" size="6"></label>
-  <label>metric
-    <select name="metric"><option value="fwd">fwd</option><option value="bwd">bwd</option></select>
-  </label>
-  <button type="submit">update</button>
+  step <select name="step">{step_options}</select>
+  rank <input name="rank" value="{rank}" size="5">
+  metric <select name="metric">{metric_options}</select>
+  refresh <select name="refresh">
+    <option value="0"{sel[0]}>off</option>
+    <option value="5"{sel[5]}>5 s</option>
+    <option value="15"{sel[15]}>15 s</option>
+    <option value="60"{sel[60]}>60 s</option>
+  </select>
+  <button type="submit">apply</button>
 </form>
-<h2>step time over training</h2>
-<img src="/png/trends?t={ts}" width="1100">
-<h2>step {latest}: per-rank pipeline</h2>
-<img src="/png/timeline?step={step}&t={ts}" width="1200">
-<div class="row">
-  <div><h2>per-rank skew</h2><img src="/png/skew?step={step}&t={ts}" width="640"></div>
-  <div><h2>rank x layer</h2><img src="/png/heatmap?step={step}&metric={metric}&t={ts}" width="640"></div>
+<h2>step time (last steps) &mdash; max/median is the imbalance; SEVERE means one rank is far behind</h2>
+{step_table}
+<h2>whole training</h2>
+<img src="/png/trends?t={os.getpid()}" width="1150">
+<h2>step {step}: pipeline per rank</h2>
+<img src="/png/timeline?step={step}&t={os.getpid()}" width="1250">
+<div class="cols">
+ <div><h2>slowest ranks</h2>{rank_table}</div>
+ <div><h2>all-to-all by layer</h2>{a2a_table}</div>
+ <div><h2>phase timers</h2>{cpu_table}</div>
 </div>
+<h2>when each rank started each layer &mdash; a bright row is a late rank, a bright cell is a late layer</h2>
+<img src="/png/starts?step={step}&t={os.getpid()}" width="1250">
+<h2>rank {rank}: compute vs comm, the gaps are the point</h2>
+<img src="/png/overlap?step={step}&rank={rank}&t={os.getpid()}" width="1250">
+<div class="cols">
+ <div><h2>per-rank skew</h2><img src="/png/skew?step={step}&t={os.getpid()}" width="620"></div>
+ <div><h2>rank x layer ({metric})</h2>
+   <img src="/png/heatmap?step={step}&metric={metric}&t={os.getpid()}" width="620"></div>
+</div>
+<h2>most expensive layers ({metric})</h2>{layer_table}
 <h2>per-layer distribution (rank {rank})</h2>
-<img src="/png/layers?rank={rank}&metric={metric}&t={ts}" width="1100">
-<script>setTimeout(function(){{ location.reload(); }}, 5000);</script>
+<img src="/png/layers?rank={rank}&metric={metric}&t={os.getpid()}" width="1150">
+<script>
+/* Reload only when there is something new: an unconditional timer makes the page flash and
+   re-renders every chart server-side on each tick, which is pure waste on a finished run. */
+var REFRESH = {refresh_seconds};
+if (REFRESH > 0) {{
+  var seen = null;
+  setInterval(function () {{
+    fetch('/api/latest').then(function (r) {{ return r.json(); }}).then(function (d) {{
+      var key = d.latest_step + ':' + d.records;
+      if (seen === null) {{ seen = key; return; }}
+      if (key !== seen) {{ seen = key; location.reload(); }}
+    }}).catch(function () {{}});
+  }}, Math.max(3000, REFRESH * 1000));
+}}
+</script>
 </body></html>
 """
 
@@ -154,18 +292,39 @@ class Handler(BaseHTTPRequestHandler):
                 step = int(q.get('step', [latest or 0])[0])
                 rank = int(q.get('rank', ['0'])[0])
                 metric = q.get('metric', ['fwd'])[0]
-                body = INDEX_HTML.format(
-                    dirpath=html.escape(STORE.dirpath),
-                    n_steps=len(STORE.steps()),
-                    latest=latest,
-                    step=step,
-                    rank=rank,
-                    metric=metric,
-                    ts=os.getpid(),
-                ).encode()
+                refresh = int(q.get('refresh', [str(REFRESH_SECONDS)])[0])
+                body = render_index(STORE, step, rank, metric, refresh).encode()
                 self._send(body, 'text/html; charset=utf-8')
+            elif path == '/api/latest':
+                steps = STORE.steps()
+                self._send(
+                    json.dumps(
+                        {
+                            'latest_step': steps[-1] if steps else None,
+                            'records': sum(len(STORE.ranks(s)) for s in steps[-5:]),
+                        }
+                    ).encode(),
+                    'application/json',
+                )
             elif path == '/api/summary':
                 self._send(json.dumps(STORE.summary()).encode(), 'application/json')
+            elif path.startswith('/api/step/') and path.endswith('/layers'):
+                step = int(path.split('/')[3])
+                metric = q.get('metric', ['fwd'])[0]
+                names, ranks, matrix = STORE.layer_matrix(step, metric)
+                import statistics
+
+                layers = []
+                for j, name in enumerate(names):
+                    col = [row[j] for row in matrix if row[j] == row[j]]
+                    if col:
+                        layers.append(
+                            {'layer': name, 'median_s': statistics.median(col), 'max_s': max(col)}
+                        )
+                self._send(
+                    json.dumps({'step': step, 'metric': metric, 'layers': layers}).encode(),
+                    'application/json',
+                )
             elif path.startswith('/api/step/'):
                 step = int(path.rsplit('/', 1)[-1])
                 rows = [
@@ -223,10 +382,19 @@ def main():
     ap.add_argument('--port', type=int, default=8080)
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--max-steps', type=int, default=4096)
+    ap.add_argument(
+        '--refresh-seconds',
+        type=int,
+        default=15,
+        help='page auto-refresh interval; 0 disables it. The page only reloads when '
+        'the data actually changed, so a finished run sits still.',
+    )
     ap.add_argument('--once', action='store_true', help='render a static report and exit')
     ap.add_argument('--out', default='perf_report.html')
     args = ap.parse_args()
 
+    global REFRESH_SECONDS
+    REFRESH_SECONDS = args.refresh_seconds
     STORE = TraceStore(args.dir, max_steps=args.max_steps)
     added = STORE.refresh()
     print(f'loaded {added} record(s) from {args.dir}; steps={len(STORE.steps())}')

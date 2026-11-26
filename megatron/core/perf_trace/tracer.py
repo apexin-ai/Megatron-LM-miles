@@ -404,7 +404,13 @@ class PerfTracer:
                 open_fwd[name] = t
             elif kind == 'layer_fwd_end':
                 if name in open_fwd:
-                    per_layer.setdefault(name, {})['fwd'] = t - open_fwd.pop(name)
+                    start = open_fwd.pop(name)
+                    slot = per_layer.setdefault(name, {})
+                    slot['fwd'] = t - start
+                    # Absolute position of this layer's forward, relative to the step anchor.
+                    # Without it a timeline can only stack durations and cannot answer "when did
+                    # this rank start layer 20", which is the whole point of the chart.
+                    slot['fs'] = start
             elif kind == 'layer_bwd_end':
                 bwd_ends.append((name, t))
             elif kind == 'span':
@@ -440,7 +446,9 @@ class PerfTracer:
             name_i, t_i = ends[idx]
             _, t_prev = ends[idx - 1]
             if t_i > t_prev:
-                per_layer.setdefault(name_i, {})['bwd'] = t_i - t_prev
+                slot = per_layer.setdefault(name_i, {})
+                slot['bwd'] = t_i - t_prev
+                slot['bs'] = t_prev
 
         fetches = item.get('data_fetches') or []
         if fetches:
@@ -456,7 +464,7 @@ class PerfTracer:
         out['phases'] = phases
         # Keep the file small: microsecond integers, layer order preserved.
         out['layers'] = [
-            {'n': n, **{k: int(round(v * 1000)) for k, v in per_layer[n].items()}}
+            dict({'n': n}, **{k: int(round(v * 1000)) for k, v in per_layer[n].items()})
             for n in per_layer
         ]
         out['spans'] = [

@@ -203,6 +203,10 @@ class TraceStore:
                     names.append(name)
                 if metric in layer:
                     row[name] = layer[metric] / 1e6
+                elif metric == 'fwd_start' and 'fs' in layer:
+                    row[name] = layer['fs'] / 1e6
+                elif metric == 'bwd_start' and 'bs' in layer:
+                    row[name] = layer['bs'] / 1e6
             per_rank[rank] = row
         nan = float('nan')
         matrix = [[per_rank[r].get(n, nan) for n in names] for r in ranks]
@@ -273,6 +277,8 @@ def draw_step_timeline(store: TraceStore, step: int, align: str = 'start') -> by
                     )
                 )
                 cursor += dur
+        # Comm lane: draw the A2A on a separate row band so a gap between compute and comm, or
+        # an overlap with it, is visible at a glance.
         for sp in rec.get('spans', []):
             ax.add_patch(
                 mpatches.Rectangle(
@@ -437,6 +443,100 @@ def draw_layer_heatmap(store: TraceStore, step: int, metric: str = 'fwd') -> byt
     ax.set_ylabel('rank')
     ax.set_title(f'step {step}: {metric} time per layer per rank (s)')
     fig.colorbar(im, ax=ax, label='seconds')
+    fig.tight_layout()
+    return _png(fig)
+
+
+def draw_layer_start_heatmap(store: TraceStore, step: int, metric: str = 'fwd_start') -> bytes:
+    """Heatmap of *when* each rank started each layer (seconds since the step anchor).
+
+    This is the imbalance view: a rank that is late shows up as a bright row across the whole
+    width, while a single hot cell means one layer started late on that rank. Duration heatmaps
+    cannot show waiting; start times can.
+    """
+    plt = _plt()
+    names, ranks, matrix = store.layer_matrix(step, metric)
+    if not names or not ranks:
+        raise ValueError(f'no start offsets for step {step} (re-run with a newer tracer)')
+    fig, ax = plt.subplots(figsize=(max(9, 0.14 * len(names) + 4), max(3, 0.12 * len(ranks) + 2)))
+    im = ax.imshow(matrix, aspect='auto', cmap='viridis', interpolation='nearest')
+    ax.set_yticks(range(len(ranks)))
+    ax.set_yticklabels([str(r) for r in ranks], fontsize=6)
+    step_x = max(1, len(names) // 40)
+    ax.set_xticks(range(0, len(names), step_x))
+    ax.set_xticklabels(names[::step_x], rotation=90, fontsize=6)
+    ax.set_xlabel('layer')
+    ax.set_ylabel('rank')
+    ax.set_title(f'step {step}: when each rank STARTED each layer (s since anchor)')
+    fig.colorbar(im, ax=ax, label='start time (s)')
+    fig.tight_layout()
+    return _png(fig)
+
+
+def draw_overlap(store: TraceStore, step: int, rank: int) -> bytes:
+    """One rank's lanes over time: compute, comm and the gaps between them.
+
+    The gaps are the point. A collective that does not overlap compute shows up as a comm block
+    sitting alone with compute idle on both sides; good overlap shows orange nested inside blue.
+    """
+    import matplotlib.patches as mpatches
+
+    plt = _plt()
+    rec = store.get(step, rank)
+    if not rec:
+        raise ValueError(f'no record for rank {rank} step {step}')
+    layers = rec.get('layers', [])
+    fig, ax = plt.subplots(figsize=(14, 3.2))
+    for i, layer in enumerate(layers):
+        if 'fs' in layer:
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (layer['fs'] / 1e6, 0.55),
+                    layer.get('fwd', 0) / 1e6,
+                    0.30,
+                    facecolor=_DEFAULT_COLORS['fwd'],
+                    edgecolor='none',
+                )
+            )
+        if 'bs' in layer:
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (layer['bs'] / 1e6, 0.15),
+                    layer.get('bwd', 0) / 1e6,
+                    0.30,
+                    facecolor=_DEFAULT_COLORS['bwd'],
+                    edgecolor='none',
+                )
+            )
+    for a in rec.get('a2a', []):
+        ax.add_patch(
+            mpatches.Rectangle(
+                (a['s'] / 1e6, 0.55),
+                a['d'] / 1e6,
+                0.30,
+                facecolor=_DEFAULT_COLORS['a2a'],
+                edgecolor='none',
+                alpha=0.85,
+            )
+        )
+    for sp in rec.get('spans', []):
+        ax.add_patch(
+            mpatches.Rectangle(
+                (sp['s'] / 1e6, 0.15),
+                sp['d'] / 1e6,
+                0.30,
+                facecolor=_DEFAULT_COLORS['span'],
+                edgecolor='none',
+            )
+        )
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    ax.set_xlabel('time since step anchor (s)')
+    ax.set_title(
+        f'rank {rank} step {step}: blue=fwd (top)  green=bwd (bottom)  '
+        'orange=A2A overlaid where it actually runs  purple=optimizer'
+    )
+    ax.grid(axis='x', alpha=0.25)
     fig.tight_layout()
     return _png(fig)
 

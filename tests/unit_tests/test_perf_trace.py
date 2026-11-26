@@ -363,3 +363,19 @@ def test_backward_is_derived_from_end_markers(tracer, clock, tmp_path):
     assert by['l1']['bwd'] == 2000
     # the first layer to finish has no previous end, so no duration is invented for it
     assert 'l3' not in by
+
+
+def test_layer_start_offsets_are_recorded(tracer, clock, tmp_path):
+    """A timeline needs *when* a layer ran, not only how long it took."""
+    tracer.begin_step(9)
+    clock.tick(5.0)  # 5 ms after the anchor
+    tracer.mark_layer_forward_start('l2')
+    clock.tick(2.0)
+    tracer.mark_layer_forward_end('l2')
+    tracer.end_step()
+    tracer.close()
+
+    layer = _read_lines(tmp_path)[0]['layers'][0]
+    assert layer['n'] == 'l2'
+    assert layer['fs'] == 5000  # microseconds since anchor
+    assert layer['fwd'] == 2000
