@@ -105,6 +105,7 @@ class PerfTracer:
         out_dir: str,
         rank: int,
         every_n_steps: int = 1,
+        skip_first_steps: int = 0,
         max_layers: int = 256,
         event_factory: Optional[Callable[[], Any]] = None,
         clock: Callable[[], float] = time.time,
@@ -116,6 +117,11 @@ class PerfTracer:
         self.out_dir = out_dir
         self.rank = rank
         self.every_n_steps = every_n_steps
+        # The first steps after install can carry one-off costs (lazy NCCL setup, a fresh event
+        # pool, first-touch autograd hooks) that look like a 100 ms collective. Skipping them is
+        # cheaper than explaining a phantom outlier later.
+        self.skip_first_steps = skip_first_steps
+        self._steps_seen = 0
         self.max_layers = max_layers
         self._clock = clock
         self._pool = _EventPool(event_factory)
@@ -185,6 +191,10 @@ class PerfTracer:
     # ------------------------------------------------------------------ capture
     def enabled_for(self, step: int) -> bool:
         """Return whether ``step`` should be traced."""
+        if self.skip_first_steps:
+            self._steps_seen += 1
+            if self._steps_seen <= self.skip_first_steps:
+                return False
         return self.every_n_steps > 0 and step % self.every_n_steps == 0
 
     def begin_step(self, step: int) -> bool:

@@ -610,7 +610,11 @@ def to_perfetto(store: TraceStore, steps: Optional[List[int]] = None) -> dict:
                     events.append(
                         {
                             'ph': 'X',
-                            'name': layer['n'],
+                            'name': (
+                                layer['n'].replace('l', 'L', 1)
+                                if layer['n'].startswith('l')
+                                else layer['n']
+                            ),
                             'pid': rank,
                             'tid': _PERFETTO_TIDS[lane],
                             'ts': offset + layer[key],
@@ -782,6 +786,13 @@ def draw_pipeline_gantt(
     n_layers = max(1, len(all_names))
     lo, hi = layer_range if layer_range else (0, n_layers - 1)
 
+    span_hint = max(
+        1.0,
+        max(
+            ((store.get(step, rk) or {}).get('phases', {}).get('__end__', 0) / 1e6 for rk in ranks),
+            default=1.0,
+        ),
+    )
     for row, rk in enumerate(ranks):
         rec = store.get(step, rk) or {}
         y0 = (len(ranks) - 1 - row) * row_h  # rank 0 at the top
@@ -790,28 +801,32 @@ def draw_pipeline_gantt(
             if not (lo <= idx <= hi):
                 continue
             colour = cmap(idx / max(1, n_layers - 1))
-            if 'fs' in layer:
+            for lane_key, start_key, y_off in (('fwd', 'fs', 0.62), ('bwd', 'bs', 0.32)):
+                if start_key not in layer or not layer.get(lane_key):
+                    continue
+                w = max(layer[lane_key] / 1e6, 1e-5)
                 ax.add_patch(
                     mpatches.Rectangle(
-                        (layer['fs'] / 1e6, y0 + 0.62),
-                        max(layer.get('fwd', 0) / 1e6, 1e-5),
+                        (layer[start_key] / 1e6, y0 + y_off),
+                        w,
                         0.26,
                         facecolor=colour,
                         edgecolor='white',
                         linewidth=0.2,
                     )
                 )
-            if 'bs' in layer:
-                ax.add_patch(
-                    mpatches.Rectangle(
-                        (layer['bs'] / 1e6, y0 + 0.32),
-                        max(layer.get('bwd', 0) / 1e6, 1e-5),
-                        0.26,
-                        facecolor=colour,
-                        edgecolor='white',
-                        linewidth=0.2,
+                # label the layer index whenever the block is wide enough to hold it
+                if w > (span_hint * 0.018):
+                    ax.text(
+                        (layer[start_key] / 1e6) + w / 2,
+                        y0 + y_off + 0.13,
+                        layer['n'],
+                        ha='center',
+                        va='center',
+                        fontsize=5.5,
+                        color='white',
+                        clip_on=True,
                     )
-                )
         for a in rec.get('a2a', []):
             ax.add_patch(
                 mpatches.Rectangle(

@@ -4223,6 +4223,13 @@ def _add_distributed_args(parser):
         'profiler) and writes from a background thread.',
     )
     group.add_argument(
+        '--perf-trace-skip-steps',
+        type=int,
+        default=1,
+        help='Do not record the first N steps after install. The very first steps can carry '
+        'one-off costs (lazy NCCL setup, a fresh event pool) that read like a huge collective.',
+    )
+    group.add_argument(
         '--perf-trace-ranks',
         type=str,
         default='',

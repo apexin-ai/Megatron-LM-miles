@@ -371,6 +371,7 @@ def maybe_install(args: Any, model_chunks: List[Any]) -> Optional[Any]:
         out_dir=out_dir,
         rank=rank,
         every_n_steps=int(getattr(args, 'perf_trace_every_n_steps', 1) or 1),
+        skip_first_steps=int(getattr(args, 'perf_trace_skip_steps', 0) or 0),
         max_layers=int(getattr(args, 'perf_trace_max_layers', 256) or 256),
     )
     tracer.start()

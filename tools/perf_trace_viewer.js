@@ -176,7 +176,7 @@
           if (lane === 'bwd') ctx.globalAlpha = 0.85;
           ctx.fillRect(left, ly, xw, laneH[lane]);
           ctx.globalAlpha = 1;
-          if (xw > 34) {
+          if (xw > 22) {
             ctx.fillStyle = '#fff';
             ctx.font = '9px ui-monospace, monospace';
             ctx.textAlign = 'left';
@@ -185,7 +185,10 @@
             ctx.beginPath();
             ctx.rect(left, ly, xw, laneH[lane]);
             ctx.clip();
-            ctx.fillText(lane === 'comm' ? (blk.layer || blk.n) : blk.n,
+            ctx.fillText(
+              lane === 'comm'
+                ? 'A2A ' + (blk.layer || blk.n)
+                : (blk.n.charAt(0) === 'l' ? 'L' + blk.n.slice(1) : blk.n),
                          left + 3, ly + laneH[lane] / 2 + 0.5);
             ctx.restore();
           }
