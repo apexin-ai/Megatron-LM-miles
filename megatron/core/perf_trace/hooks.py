@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 
 TRACER: Optional[Any] = None  # module-level singleton, set by maybe_install()
 
+# The layer whose forward is on the stack right now. MoE all-to-alls are issued from inside a
+# layer's forward, so this is what lets an A2A be attributed to a layer instead of just "some
+# dispatch happened". Forward is single-threaded on the main thread, so a module-level stack is
+# enough; it is a plain list for the same reason.
+_LAYER_STACK: List[str] = []
+
+
+def current_layer() -> Optional[str]:
+    """Return the layer whose forward is running, if any."""
+    return _LAYER_STACK[-1] if _LAYER_STACK else None
+
 
 def get_tracer() -> Optional[Any]:
     """Return the active tracer, if tracing is enabled."""
@@ -113,12 +124,15 @@ def install_layer_hooks(tracer: Any, model_chunks: List[Any], max_layers: int = 
 
         def _fwd_pre(_mod, _args, _name=name):
             try:
+                _LAYER_STACK.append(_name)
                 tracer.mark_layer_forward_start(_name)
             except Exception:  # tracing must never break the step
                 _warn_once('hook-fwd-pre', 'perf-trace: forward pre-hook failed for %s', _name)
 
         def _fwd_post(_mod, _args, _out, _name=name):
             try:
+                if _LAYER_STACK and _LAYER_STACK[-1] == _name:
+                    _LAYER_STACK.pop()
                 tracer.mark_layer_forward_end(_name)
             except Exception:
                 _warn_once('hook-fwd-post', 'perf-trace: forward post-hook failed for %s', _name)
@@ -146,8 +160,20 @@ def install_layer_hooks(tracer: Any, model_chunks: List[Any], max_layers: int = 
         except Exception:
             _warn_once('fwd-hook', 'perf-trace: could not attach forward hooks to %s', name)
             continue
-        # No module-level backward hooks: their firing points do not bracket the layer's
-        # backward. The tensor hook above gives the start; _convert derives the duration.
+
+        # A module *post* backward hook fires when the layer's input grads are ready, i.e. when
+        # its backward is done. Those end markers, sorted, give the per-layer backward durations;
+        # the *pre* hooks do not bracket anything useful and are deliberately not used.
+        def _bwd_end_hook(_mod, _grad_in, _grad_out, _name=name):
+            try:
+                tracer.mark_layer_backward_end(_name)
+            except Exception:
+                _warn_once('hook-bwd-end', 'perf-trace: backward end hook failed for %s', _name)
+
+        try:
+            layer.register_full_backward_hook(_bwd_end_hook)
+        except Exception:
+            _warn_once('hook-bwd-reg', 'perf-trace: could not register backward hook on %s', name)
     return count
 
 
@@ -207,7 +233,7 @@ def install_a2a_hooks(tracer: Any) -> int:
                     stream = get_comm_stream()
                 except Exception:
                     stream = None
-                tracer.mark_a2a(f'{__tag}{__suffix}', stream=stream)
+                tracer.mark_a2a(f'{__tag}{__suffix}', stream=stream, layer=current_layer())
                 return __orig(self, *args, **_kw)
 
             _wrapper._perf_traced = True  # type: ignore[attr-defined]

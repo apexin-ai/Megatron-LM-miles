@@ -264,8 +264,13 @@ class PerfTracer:
     def mark_layer_backward_end(self, name: str) -> int:
         return self._record('layer_bwd_end', name)
 
-    def mark_a2a(self, name: str, stream: Any = None) -> int:
-        return self._record('a2a', name, stream=stream)
+    def mark_a2a(self, name: str, stream: Any = None, layer: Optional[str] = None) -> int:
+        """Mark a MoE all-to-all, optionally attributed to the layer that issued it."""
+        return self._record('a2a', f'{layer}|{name}' if layer else name, stream=stream)
+
+    def mark_layer_backward_end(self, name: str) -> int:
+        """Mark the end of a layer's backward."""
+        return self._record('layer_bwd_end', name)
 
     def mark_span_start(self, name: str) -> int:
         """Open a named span on the GPU timeline (optimizer, grad sync, param sync, ...)."""
@@ -386,7 +391,7 @@ class PerfTracer:
         open_bwd: Dict[str, float] = {}
         open_a2a: Dict[str, float] = {}
         spans: List[Dict[str, float]] = []
-        bwd_starts_in_order: List[Optional[tuple]] = []
+        bwd_ends: List[tuple] = []
         open_span: Dict[str, float] = {}
 
         for kind, name, idx in item['records']:
@@ -400,11 +405,8 @@ class PerfTracer:
             elif kind == 'layer_fwd_end':
                 if name in open_fwd:
                     per_layer.setdefault(name, {})['fwd'] = t - open_fwd.pop(name)
-            elif kind == 'layer_bwd':
-                bwd_starts_in_order.append((name, t))
             elif kind == 'layer_bwd_end':
-                if name in open_bwd:
-                    per_layer.setdefault(name, {})['bwd'] = t - open_bwd.pop(name)
+                bwd_ends.append((name, t))
             elif kind == 'span':
                 if name.endswith(':start'):
                     open_span[name[:-6]] = t
@@ -412,11 +414,33 @@ class PerfTracer:
                     st = open_span.pop(name[:-4])
                     spans.append({'n': name[:-4], 's': st * 1000.0, 'd': (t - st) * 1000.0})
             elif kind == 'a2a':
-                if name.endswith(':start'):
-                    open_a2a[name[:-6]] = t
-                elif name.endswith(':end') and name[:-4] in open_a2a:
-                    s = open_a2a.pop(name[:-4])
-                    a2a.append({'name': name[:-4], 'start': s, 'dur': t - s})
+                # names look like "l12|dispatch:start" when the layer was known, else
+                # "dispatch:start"
+                layer_name, sep, op = name.partition('|')
+                if not sep:
+                    layer_name, op = '', name
+                key = f'{layer_name}|{op}' if layer_name else op
+                if op.endswith(':start'):
+                    open_a2a[key[:-6]] = t
+                elif op.endswith(':end') and key[:-4] in open_a2a:
+                    st = open_a2a.pop(key[:-4])
+                    base = key[:-4]
+                    lname, sep2, opname = base.partition('|')
+                    entry = {'name': opname if sep2 else lname, 'start': st, 'dur': t - st}
+                    if sep2:
+                        entry['layer'] = lname
+                    a2a.append(entry)
+
+        # Per-layer backward from the *end* markers. Backward finishes the last layer first, so
+        # sorting the end times ascending gives the reverse execution order: each layer's duration
+        # is the gap to the previous end. The first one to finish has no previous end, so its
+        # duration is left unset rather than guessed from the forward.
+        ends = sorted([(name, t) for name, t in bwd_ends if t is not None], key=lambda x: x[1])
+        for idx in range(1, len(ends)):
+            name_i, t_i = ends[idx]
+            _, t_prev = ends[idx - 1]
+            if t_i > t_prev:
+                per_layer.setdefault(name_i, {})['bwd'] = t_i - t_prev
 
         fetches = item.get('data_fetches') or []
         if fetches:
@@ -428,19 +452,6 @@ class PerfTracer:
             }
         if getattr(self, '_last_step_wall', None) is not None:
             out['step_wall'] = int(round(self._last_step_wall * 1e6))
-        # Backward durations come from consecutive layer-start markers: backward runs the
-        # layers in reverse execution order, so layer i's backward lasts until layer i-1 starts.
-        bwd_starts = [v for v in bwd_starts_in_order if v is not None]
-        if len(bwd_starts) > 1:
-            for idx in range(len(bwd_starts) - 1):
-                name_i, t_i = bwd_starts[idx]
-                _, t_next = bwd_starts[idx + 1]
-                per_layer.setdefault(name_i, {})['bwd'] = t_next - t_i
-            last_name, last_t = bwd_starts[-1]
-            end_ref = phases.get('__end__', last_t) / 1000.0
-            if end_ref > last_t:
-                per_layer.setdefault(last_name, {})['bwd'] = end_ref - last_t
-
         out['anchor_wall'] = item['anchor_wall']
         out['phases'] = phases
         # Keep the file small: microsecond integers, layer order preserved.
@@ -454,7 +465,14 @@ class PerfTracer:
         if item.get('cpu_phases'):
             out['cpu'] = {k: int(round(v * 1e6)) for k, v in item['cpu_phases'].items()}
         out['a2a'] = [
-            {'n': a['name'], 's': int(round(a['start'] * 1000)), 'd': int(round(a['dur'] * 1000))}
+            dict(
+                {
+                    'n': a['name'],
+                    's': int(round(a['start'] * 1000)),
+                    'd': int(round(a['dur'] * 1000)),
+                },
+                **({'layer': a['layer']} if a.get('layer') else {}),
+            )
             for a in a2a
         ]
         return out

@@ -162,6 +162,23 @@ class TraceStore:
             rows.append((rank, end / 1e6, fwd / 1e6, bwd / 1e6, a2a / 1e6))
         return sorted(rows, key=lambda r: -r[1])
 
+    def a2a_by_layer(self, step: int) -> Dict[str, float]:
+        """Per-layer total all-to-all time (seconds), summed over dispatch and combine.
+
+        Without this an A2A spike can only be blamed on "some layer"; with it the report can point
+        at the layer that issued it, which is what tells an expert-load problem apart from a
+        kernel problem.
+        """
+        out: Dict[str, float] = defaultdict(float)
+        ranks = self.ranks(step)
+        for rank in ranks:
+            rec = self.get(step, rank) or {}
+            for a in rec.get('a2a', []):
+                layer = a.get('layer') or 'unattributed'
+                out[layer] += a.get('d', 0)
+        n = max(1, len(ranks))
+        return {k: v / 1e6 / n for k, v in out.items()}
+
     def layer_matrix(
         self, step: int, metric: str = 'fwd'
     ) -> Tuple[List[str], List[int], List[List[float]]]:
